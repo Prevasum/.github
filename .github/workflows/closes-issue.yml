@@ -1,0 +1,39 @@
+name: PR Closes Issue Validation
+
+# The `closes-issue` org ruleset runs this on every repo's PRs into its
+# default branch, so no repo needs its own copy.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  pull-requests: read
+  issues: read
+
+jobs:
+  validate-closes-issue:
+    # Release-please PRs only bump the version and changelog, and close no
+    # issue. A skipped job counts as passing, so they can still merge.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR Closes Issue Validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        # GitHub lists the issues a PR closes only once the Closes line names an
+        # issue that exists. It can lag a few seconds behind an edit, so retry.
+        run: |
+          for attempt in 1 2 3; do
+            closes="$(gh pr view "$PR" -R "$REPO" --json closingIssuesReferences \
+              -q '[.closingIssuesReferences[] | "#\(.number)"] | join(" ")')"
+            if [ -n "$closes" ]; then
+              echo "PR closes $closes"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::The PR body must end with 'Closes #<issue>', naming an issue that exists. See CODING_STANDARDS.md in Prevasum/docs."
+          exit 1
