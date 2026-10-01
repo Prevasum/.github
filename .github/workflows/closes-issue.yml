@@ -1,6 +1,6 @@
 name: PR Closes Issue Validation
 
-# The `closes-issue` org ruleset runs this on every repo's PRs into its
+# The `pr-checks` org ruleset runs this on every repo's PRs into its
 # default branch, so no repo needs its own copy.
 
 on:
