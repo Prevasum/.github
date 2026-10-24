@@ -24,9 +24,11 @@ jobs:
     steps:
       - name: PR Closes Issue Validation
         env:
-          # The default token can't read other private repos, so a
-          # `Closes <org>/<repo>#<n>` would be listed as closing nothing.
-          GH_TOKEN: ${{ secrets.CI_READ_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
+          # Reads issues in other private repos, which the default token can't,
+          # but not pull requests, so it never looks up the PR itself.
+          CI_READ_TOKEN: ${{ secrets.CI_READ_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         # GitHub lists the issues a PR closes only once the Closes line names an
@@ -40,6 +42,20 @@ jobs:
               exit 0
             fi
             sleep 5
+          done
+          # The default token can't see an issue in another private repo, so the
+          # PR lists it as closing nothing. Check each such reference directly.
+          body="$(gh pr view "$PR" -R "$REPO" --json body -q .body)"
+          refs="$(printf '%s\n' "$body" \
+            | grep -oiE "(close[sd]?|fix(e[sd])?|resolve[sd]?):? +$OWNER/[A-Za-z0-9._-]+#[0-9]+" \
+            | grep -oE '[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+' || true)"
+          for ref in $refs; do
+            found="$(GH_TOKEN="$CI_READ_TOKEN" gh api "repos/${ref%#*}/issues/${ref#*#}" \
+              --jq 'select(.pull_request | not) | .number' 2>/dev/null || true)"
+            if [ -n "$found" ]; then
+              echo "PR closes $ref"
+              exit 0
+            fi
           done
           echo "::error::The PR body must end with 'Closes #<issue>' (or 'Closes <org>/<repo>#<issue>' for another repo), naming an issue that exists. See CODING_STANDARDS.md in Prevasum/docs."
           exit 1
