@@ -5,14 +5,20 @@ name: Deliver
 # dev (the `environment` input), which sets these variables:
 #
 #   GCP_PROJECT                 the Environment's project
-#   GCP_REGION                  where its Cloud Run services, jobs, and worker
-#                               pools run
+#   GCP_REGION                  where its Cloud Run services, jobs, worker
+#                               pools, and instance groups run
 #   GCP_WIF_PROVIDER            its Workload Identity provider
 #   GCP_DEPLOY_SERVICE_ACCOUNT  the repo's deploy identity there
 #   IMAGE_REPOSITORY            the service's repository in the image registry
 #   DEPLOY_RESOURCES            a JSON object naming, for each target and the
 #                               migrations job, its resource in the Environment
 #   SMOKE_JOB                   the Environment's smoke Cloud Run job
+#
+# An instance-group target is a regional managed instance group that
+# autoheals on the health check its load balancer uses. Its instance
+# template's metadata `image` names the image its instances run, and each
+# instance, once its container starts, writes that container's image by
+# digest to its guest attribute `container/image`.
 #
 # The caller grants `contents: read` and `id-token: write`, since a called
 # workflow can't hold more than its caller.
@@ -28,7 +34,8 @@ on:
         description: >-
           A JSON list of deploy targets, each {"name": ..., "kind": ...}, all
           deployed from the one image. Kinds: cloud-run, cloud-run-job,
-          worker-pool.
+          worker-pool, instance-group. A target with "prod-only": true runs
+          outside every Environment, so this only builds its image.
         required: true
         type: string
       migrations:
@@ -53,6 +60,13 @@ on:
         required: false
         type: string
         default: development
+      image-repository:
+        description: >-
+          The service's repository in the image registry, when it isn't the
+          environment's IMAGE_REPOSITORY.
+        required: false
+        type: string
+        default: ""
       tag-prod:
         description: >-
           Also move :prod once dev passes, so readers have a prod image to
@@ -73,11 +87,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+    env:
+      IMAGE_REPOSITORY: ${{ inputs.image-repository || vars.IMAGE_REPOSITORY }}
     outputs:
       image: ${{ steps.image.outputs.image }}
+      dev-targets: ${{ steps.targets.outputs.dev-targets }}
     steps:
       # Checked before building, so a misconfigured caller fails in seconds.
       - name: Check the targets
+        id: targets
         env:
           TARGETS: ${{ inputs.targets }}
           MIGRATIONS: ${{ inputs.migrations }}
@@ -91,14 +109,18 @@ jobs:
           failed=0
           while IFS=$'\t' read -r name kind; do
             case "$kind" in
-              cloud-run | cloud-run-job | worker-pool) ;;
+              cloud-run | cloud-run-job | worker-pool | instance-group) ;;
               *) echo "::error::target $name has unknown kind '$kind'"; failed=1 ;;
             esac
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
-          for name in $(jq -r '.[].name' <<<"$TARGETS") $MIGRATIONS; do
+          jq -e 'all(.[]; .["prod-only"] | . == null or type == "boolean")' <<<"$TARGETS" >/dev/null \
+            || { echo "::error::a target's prod-only must be true or false"; failed=1; }
+          dev_targets="$(jq -c 'map(select(.["prod-only"] != true))' <<<"$TARGETS")"
+          for name in $(jq -r '.[].name' <<<"$dev_targets") $MIGRATIONS; do
             jq -e --arg n "$name" '.[$n] | type == "string"' <<<"$DEPLOY_RESOURCES" >/dev/null \
               || { echo "::error::DEPLOY_RESOURCES names no resource for $name"; failed=1; }
           done
+          echo "dev-targets=$dev_targets" >>"$GITHUB_OUTPUT"
           exit "$failed"
 
       - uses: actions/checkout@v4
@@ -111,8 +133,6 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Sign Docker in to the registry
-        env:
-          IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
         run: gcloud auth configure-docker "${IMAGE_REPOSITORY%%/*}" --quiet
 
       - uses: docker/setup-buildx-action@v3
@@ -125,7 +145,7 @@ jobs:
           file: ${{ inputs.file }}
           push: true
           build-args: GIT_SHA=${{ github.sha }}
-          tags: ${{ vars.IMAGE_REPOSITORY }}/${{ inputs.service }}:sha-${{ github.sha }}
+          tags: ${{ env.IMAGE_REPOSITORY }}/${{ inputs.service }}:sha-${{ github.sha }}
           # Without an attestation the push is a single image manifest, so
           # the digest recorded here is the one every deploy target reports.
           provenance: false
@@ -135,7 +155,7 @@ jobs:
       - name: Record the digest
         id: image
         env:
-          IMAGE: ${{ vars.IMAGE_REPOSITORY }}/${{ inputs.service }}
+          IMAGE: ${{ env.IMAGE_REPOSITORY }}/${{ inputs.service }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           echo "image=$IMAGE@$DIGEST" >>"$GITHUB_OUTPUT"
@@ -143,6 +163,7 @@ jobs:
 
   dev:
     needs: build
+    if: needs.build.outputs.dev-targets != '[]'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     concurrency:
@@ -150,10 +171,11 @@ jobs:
       cancel-in-progress: false
     env:
       IMAGE: ${{ needs.build.outputs.image }}
-      TARGETS: ${{ inputs.targets }}
+      TARGETS: ${{ needs.build.outputs.dev-targets }}
       DEPLOY_RESOURCES: ${{ vars.DEPLOY_RESOURCES }}
       CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT }}
       CLOUDSDK_RUN_REGION: ${{ vars.GCP_REGION }}
+      CLOUDSDK_COMPUTE_REGION: ${{ vars.GCP_REGION }}
     steps:
       - uses: google-github-actions/auth@v2
         with:
@@ -276,6 +298,118 @@ jobs:
             echo "$resource runs $IMAGE on revision $revision"
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
 
+      # A new template copies the current one but for its image, and a
+      # rolling update brings an instance up on it before the old one goes.
+      # The old one can drain for up to an hour, so this waits only for the
+      # new one to be healthy, which, since the group autoheals on its load
+      # balancer's health check, is when the load balancer sends it new
+      # flows. `wait-until --stable` would wait out the drain too. The bounds
+      # leave the rollback time to finish inside the 5 minutes a failed
+      # deploy may last.
+      - name: Roll out the instance groups
+        run: |
+          set -euo pipefail
+          # The rollback step runs this file too.
+          cat >"$RUNNER_TEMP/instance-group.sh" <<'HELPERS'
+          # Waits up to $3 seconds for an instance of group $1 on template $2
+          # to be running and healthy, and prints its URL.
+          healthy_instance() {
+            local deadline=$((SECONDS + $3)) instance
+            while :; do
+              instance="$(gcloud compute instance-groups managed list-instances "$1" \
+                --region "$CLOUDSDK_COMPUTE_REGION" --format=json \
+                | jq -r --arg t "${2#*/projects/}" 'first(.[]
+                    | select((.version.instanceTemplate | sub("^.*/projects/"; "")) == $t
+                      and .instanceStatus == "RUNNING" and .currentAction == "NONE"
+                      and (.instanceHealth // []) != []
+                      and all(.instanceHealth[]; .detailedHealthState == "HEALTHY"))
+                    | .instance) // empty')"
+              if [ -n "$instance" ]; then
+                echo "$instance"
+                return 0
+              fi
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                return 1
+              fi
+              sleep 10
+            done
+          }
+          HELPERS
+          # shellcheck source=/dev/null
+          . "$RUNNER_TEMP/instance-group.sh"
+          token="$(gcloud auth print-access-token)"
+          auth=(-H "Authorization: Bearer $token" -H "Content-Type: application/json")
+          digest="${IMAGE##*@}"
+          while IFS=$'\t' read -r name kind; do
+            [ "$kind" = instance-group ] || continue
+            group="$(jq -r --arg n "$name" '.[$n]' <<<"$DEPLOY_RESOURCES")"
+            current="$(gcloud compute instance-groups managed describe "$group" \
+              --region "$CLOUDSDK_COMPUTE_REGION" --format=json \
+              | jq -r 'if (.versions | length) == 1 then .versions[0].instanceTemplate else empty end')"
+            if [ -z "$current" ]; then
+              echo "::error::$group isn't on exactly one instance template."
+              exit 1
+            fi
+
+            # A rerun of the same digest finds its template already made.
+            hex="${digest#sha256:}"
+            template_name="${group:0:50}"
+            template_name="${template_name%-}-${hex:0:12}"
+            template="${current%/*}/$template_name"
+            status="$(curl -sS -o "$RUNNER_TEMP/template.json" -w '%{http_code}' "${auth[@]}" "$template")"
+            if [ "$status" = 404 ]; then
+              curl -fsS "${auth[@]}" "$current" >"$RUNNER_TEMP/current.json"
+              jq -e '[.properties.metadata.items[]? | select(.key == "image")] | length == 1' \
+                "$RUNNER_TEMP/current.json" >/dev/null \
+                || { echo "::error::$current has no image metadata."; exit 1; }
+              jq --arg name "$template_name" --arg image "$IMAGE" '
+                {name: $name, properties: (.properties
+                  | .metadata.items |= map(if .key == "image" then .value = $image else . end)
+                  | del(.metadata.fingerprint))}' \
+                "$RUNNER_TEMP/current.json" >"$RUNNER_TEMP/template.json"
+              operation="$(curl -fsS "${auth[@]}" --data @"$RUNNER_TEMP/template.json" "${current%/*}" | jq -r .selfLink)"
+              # Each wait call returns when the operation is done or after
+              # about 2 minutes, whichever is first.
+              while :; do
+                curl -fsS "${auth[@]}" -X POST "$operation/wait" >"$RUNNER_TEMP/operation.json"
+                jq -e '.status == "DONE"' "$RUNNER_TEMP/operation.json" >/dev/null && break
+              done
+              if jq -e '.error' "$RUNNER_TEMP/operation.json" >/dev/null; then
+                echo "::error::Creating $template failed: $(jq -c .error "$RUNNER_TEMP/operation.json")"
+                exit 1
+              fi
+            elif [ "$status" = 200 ]; then
+              jq -e --arg image "$IMAGE" '[.properties.metadata.items[]? | select(.key == "image") | .value] == [$image]' \
+                "$RUNNER_TEMP/template.json" >/dev/null \
+                || { echo "::error::$template exists with another image."; exit 1; }
+            else
+              echo "::error::Reading $template returned HTTP $status."
+              exit 1
+            fi
+
+            gcloud compute instance-groups managed rolling-action start-update "$group" \
+              --region "$CLOUDSDK_COMPUTE_REGION" --version=template="$template" \
+              --max-surge=1 --max-unavailable=0 --quiet
+            printf 'instance-group\t%s\t%s\n' "$group" "$current" >>"$RUNNER_TEMP/rollback.tsv"
+            instance="$(healthy_instance "$group" "$template" 240)" \
+              || { echo "::error::No instance of $group on $template was healthy within 4 minutes."; exit 1; }
+
+            zone="$(sed -E 's|.*/zones/([^/]+)/.*|\1|' <<<"$instance")"
+            running=""
+            for _ in 1 2 3 4 5 6; do
+              if running="$(gcloud compute instances get-guest-attributes "${instance##*/}" --zone "$zone" \
+                --query-path=container/image --format='value(value)' 2>/dev/null)" && [ -n "$running" ]; then
+                break
+              fi
+              sleep 5
+            done
+            if [ "${running##*@}" != "$digest" ]; then
+              echo "::error::${instance##*/} runs '$running', not $IMAGE."
+              exit 1
+            fi
+            echo "$group runs $IMAGE on ${instance##*/}"
+          done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
+
       - name: Move traffic and jobs to the new image
         run: |
           set -euo pipefail
@@ -331,10 +465,21 @@ jobs:
               cloud-run) gcloud run services update-traffic "$resource" --to-revisions="$previous" --quiet || failed=1 ;;
               cloud-run-job) gcloud run jobs update "$resource" --image "$previous" --quiet || failed=1 ;;
               worker-pool) gcloud run worker-pools deploy "$resource" --image "$previous" --quiet || failed=1 ;;
+              instance-group)
+                # shellcheck source=/dev/null
+                . "$RUNNER_TEMP/instance-group.sh"
+                if gcloud compute instance-groups managed rolling-action start-update "$resource" \
+                  --region "$CLOUDSDK_COMPUTE_REGION" --version=template="$previous" \
+                  --max-surge=1 --max-unavailable=0 --quiet; then
+                  healthy_instance "$resource" "$previous" 240 >/dev/null || failed=1
+                else
+                  failed=1
+                fi
+                ;;
               tag) gcloud artifacts docker tags add "$previous" "$resource" --quiet || failed=1 ;;
             esac
           done <"$RUNNER_TEMP/rollback.tsv"
           if [ "$failed" -ne 0 ]; then
-            echo "::error::The rollback failed; restore the previous revisions, job and worker pool images, and tags by hand."
+            echo "::error::The rollback failed; restore the previous revisions, job and worker pool images, instance templates, and tags by hand."
           fi
           exit "$failed"
