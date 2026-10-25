@@ -17,9 +17,11 @@ permissions:
 
 jobs:
   validate-closes-issue:
-    # Release-please PRs only bump the version and changelog, and close no
-    # issue. A skipped job counts as passing, so they can still merge.
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    # Bot PRs close no issue: release-please's only bump the version and
+    # changelog, and openapi-sync's only update a client's copy of an API
+    # document and the code generated from it. A skipped job counts as
+    # passing, so they can still merge.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') && !startsWith(github.head_ref, 'openapi-sync--') }}
     runs-on: ubuntu-latest
     steps:
       - name: PR Closes Issue Validation
