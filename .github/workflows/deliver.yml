@@ -5,7 +5,8 @@ name: Deliver
 # dev (the `environment` input), which sets these variables:
 #
 #   GCP_PROJECT                 the Environment's project
-#   GCP_REGION                  where its Cloud Run services and jobs run
+#   GCP_REGION                  where its Cloud Run services, jobs, and worker
+#                               pools run
 #   GCP_WIF_PROVIDER            its Workload Identity provider
 #   GCP_DEPLOY_SERVICE_ACCOUNT  the repo's deploy identity there
 #   IMAGE_REPOSITORY            the service's repository in the image registry
@@ -26,7 +27,8 @@ on:
       targets:
         description: >-
           A JSON list of deploy targets, each {"name": ..., "kind": ...}, all
-          deployed from the one image. Kinds: cloud-run, cloud-run-job.
+          deployed from the one image. Kinds: cloud-run, cloud-run-job,
+          worker-pool.
         required: true
         type: string
       migrations:
@@ -89,7 +91,7 @@ jobs:
           failed=0
           while IFS=$'\t' read -r name kind; do
             case "$kind" in
-              cloud-run | cloud-run-job) ;;
+              cloud-run | cloud-run-job | worker-pool) ;;
               *) echo "::error::target $name has unknown kind '$kind'"; failed=1 ;;
             esac
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
@@ -232,6 +234,48 @@ jobs:
           done <"$RUNNER_TEMP/candidates.tsv"
           gcloud run jobs execute "$SMOKE_JOB" --args="$args" --wait
 
+      # A worker pool takes no requests, so it has no candidate to test before
+      # it takes over: its new revision takes every instance at once, and a
+      # failure deploys the digest it ran before. The previous digest is
+      # recorded before the deploy, so a deploy that fails partway rolls back
+      # too, and the deploy's bound leaves the rollback time to finish inside
+      # the 5 minutes a failed deploy may last.
+      - name: Update the worker pools
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r name kind; do
+            [ "$kind" = worker-pool ] || continue
+            resource="$(jq -r --arg n "$name" '.[$n]' <<<"$DEPLOY_RESOURCES")"
+            serving="$(gcloud run worker-pools describe "$resource" --format=json \
+              | jq -r '[.status.instanceSplits[]? | select(.percent > 0)] | max_by(.percent) | .revisionName // empty')"
+            previous=""
+            if [ -n "$serving" ]; then
+              previous="$(gcloud run worker-pools revisions describe "$serving" --format='value(status.imageDigest)')"
+            fi
+            if [ -z "$previous" ]; then
+              echo "::error::Can't tell which digest $resource runs, so it couldn't be rolled back."
+              exit 1
+            fi
+            printf 'worker-pool\t%s\t%s\n' "$resource" "$previous" >>"$RUNNER_TEMP/rollback.tsv"
+            timeout 180 gcloud run worker-pools deploy "$resource" --image "$IMAGE" --quiet \
+              || { echo "::error::$resource's new revision didn't become ready within 3 minutes."; exit 1; }
+
+            gcloud run worker-pools describe "$resource" --format=json >"$RUNNER_TEMP/pool.json"
+            revision="$(jq -r '.status.latestCreatedRevisionName // empty' "$RUNNER_TEMP/pool.json")"
+            ready="$(jq -r '.status.latestReadyRevisionName // empty' "$RUNNER_TEMP/pool.json")"
+            serving="$(jq -r '[.status.instanceSplits[]? | select(.percent > 0) | .revisionName] | join(",")' "$RUNNER_TEMP/pool.json")"
+            if [ -z "$revision" ] || [ "$ready" != "$revision" ] || [ "$serving" != "$revision" ]; then
+              echo "::error::$resource serves '$serving', not its new revision $revision."
+              exit 1
+            fi
+            running="$(gcloud run worker-pools revisions describe "$revision" --format='value(status.imageDigest)')"
+            if [ "${running##*@}" != "${IMAGE##*@}" ]; then
+              echo "::error::$resource's revision $revision runs $running, not $IMAGE."
+              exit 1
+            fi
+            echo "$resource runs $IMAGE on revision $revision"
+          done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
+
       - name: Move traffic and jobs to the new image
         run: |
           set -euo pipefail
@@ -286,10 +330,11 @@ jobs:
             case "$kind" in
               cloud-run) gcloud run services update-traffic "$resource" --to-revisions="$previous" --quiet || failed=1 ;;
               cloud-run-job) gcloud run jobs update "$resource" --image "$previous" --quiet || failed=1 ;;
+              worker-pool) gcloud run worker-pools deploy "$resource" --image "$previous" --quiet || failed=1 ;;
               tag) gcloud artifacts docker tags add "$previous" "$resource" --quiet || failed=1 ;;
             esac
           done <"$RUNNER_TEMP/rollback.tsv"
           if [ "$failed" -ne 0 ]; then
-            echo "::error::The rollback failed; restore the previous revisions, job images, and tags by hand."
+            echo "::error::The rollback failed; restore the previous revisions, job and worker pool images, and tags by hand."
           fi
           exit "$failed"
