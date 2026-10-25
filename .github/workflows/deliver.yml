@@ -1,0 +1,295 @@
+name: Deliver
+
+# A service repo calls this on every push to its main branch. This repo is
+# public, so every identifier comes from the caller's GitHub environment for
+# dev (the `environment` input), which sets these variables:
+#
+#   GCP_PROJECT                 the Environment's project
+#   GCP_REGION                  where its Cloud Run services and jobs run
+#   GCP_WIF_PROVIDER            its Workload Identity provider
+#   GCP_DEPLOY_SERVICE_ACCOUNT  the repo's deploy identity there
+#   IMAGE_REPOSITORY            the service's repository in the image registry
+#   DEPLOY_RESOURCES            a JSON object naming, for each target and the
+#                               migrations job, its resource in the Environment
+#   SMOKE_JOB                   the Environment's smoke Cloud Run job
+#
+# The caller grants `contents: read` and `id-token: write`, since a called
+# workflow can't hold more than its caller.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: The image's name, and its repository's in the registry.
+        required: true
+        type: string
+      targets:
+        description: >-
+          A JSON list of deploy targets, each {"name": ..., "kind": ...}, all
+          deployed from the one image. Kinds: cloud-run, cloud-run-job.
+        required: true
+        type: string
+      migrations:
+        description: >-
+          A target name for a Cloud Run job that runs once to completion, on
+          the new image, before any target deploys.
+        required: false
+        type: string
+        default: ""
+      context:
+        description: The Docker build context.
+        required: false
+        type: string
+        default: .
+      file:
+        description: The Dockerfile, when it isn't the context's Dockerfile.
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: The caller's GitHub environment for dev.
+        required: false
+        type: string
+        default: development
+      tag-prod:
+        description: >-
+          Also move :prod once dev passes, so readers have a prod image to
+          resolve before the service has a prod Environment to promote to.
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image:
+        description: The image built, by digest.
+        value: ${{ jobs.build.outputs.image }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      # Checked before building, so a misconfigured caller fails in seconds.
+      - name: Check the targets
+        env:
+          TARGETS: ${{ inputs.targets }}
+          MIGRATIONS: ${{ inputs.migrations }}
+          DEPLOY_RESOURCES: ${{ vars.DEPLOY_RESOURCES }}
+        run: |
+          set -euo pipefail
+          jq -e 'type == "array" and length > 0' <<<"$TARGETS" >/dev/null \
+            || { echo "::error::targets must be a non-empty JSON list"; exit 1; }
+          jq -e 'type == "object"' <<<"${DEPLOY_RESOURCES:-null}" >/dev/null \
+            || { echo "::error::DEPLOY_RESOURCES must be a JSON object in the environment"; exit 1; }
+          failed=0
+          while IFS=$'\t' read -r name kind; do
+            case "$kind" in
+              cloud-run | cloud-run-job) ;;
+              *) echo "::error::target $name has unknown kind '$kind'"; failed=1 ;;
+            esac
+          done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
+          for name in $(jq -r '.[].name' <<<"$TARGETS") $MIGRATIONS; do
+            jq -e --arg n "$name" '.[$n] | type == "string"' <<<"$DEPLOY_RESOURCES" >/dev/null \
+              || { echo "::error::DEPLOY_RESOURCES names no resource for $name"; failed=1; }
+          done
+          exit "$failed"
+
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sign Docker in to the registry
+        env:
+          IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+        run: gcloud auth configure-docker "${IMAGE_REPOSITORY%%/*}" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          push: true
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: ${{ vars.IMAGE_REPOSITORY }}/${{ inputs.service }}:sha-${{ github.sha }}
+          # Without an attestation the push is a single image manifest, so
+          # the digest recorded here is the one every deploy target reports.
+          provenance: false
+          cache-from: type=gha,scope=deliver-${{ inputs.service }}
+          cache-to: type=gha,scope=deliver-${{ inputs.service }},mode=max
+
+      - name: Record the digest
+        id: image
+        env:
+          IMAGE: ${{ vars.IMAGE_REPOSITORY }}/${{ inputs.service }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          echo "image=$IMAGE@$DIGEST" >>"$GITHUB_OUTPUT"
+          echo "Built $IMAGE@$DIGEST" >>"$GITHUB_STEP_SUMMARY"
+
+  dev:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deliver-${{ inputs.service }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      TARGETS: ${{ inputs.targets }}
+      DEPLOY_RESOURCES: ${{ vars.DEPLOY_RESOURCES }}
+      CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT }}
+      CLOUDSDK_RUN_REGION: ${{ vars.GCP_REGION }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Migrations only expand the schema, so the revisions still serving keep
+      # working on it, and a rollback leaves it in place.
+      - name: Run the migrations
+        if: inputs.migrations != ''
+        env:
+          MIGRATIONS: ${{ inputs.migrations }}
+        run: |
+          set -euo pipefail
+          job="$(jq -r --arg n "$MIGRATIONS" '.[$n]' <<<"$DEPLOY_RESOURCES")"
+          gcloud run jobs update "$job" --image "$IMAGE" --quiet
+          gcloud run jobs execute "$job" --wait
+
+      - name: Deploy candidates
+        run: |
+          set -euo pipefail
+          # The rollback step restores what rollback.tsv records, written as
+          # each target changes.
+          : >"$RUNNER_TEMP/rollback.tsv"
+          : >"$RUNNER_TEMP/candidates.tsv"
+          while IFS=$'\t' read -r name kind; do
+            resource="$(jq -r --arg n "$name" '.[$n]' <<<"$DEPLOY_RESOURCES")"
+            case "$kind" in
+              cloud-run)
+                gcloud run deploy "$resource" --image "$IMAGE" \
+                  --no-traffic --tag candidate --quiet
+                gcloud run services describe "$resource" --format=json >"$RUNNER_TEMP/service.json"
+                revision="$(jq -r '.status.traffic[] | select(.tag == "candidate") | .revisionName' "$RUNNER_TEMP/service.json")"
+                url="$(jq -r '.status.traffic[] | select(.tag == "candidate") | .url' "$RUNNER_TEMP/service.json")"
+                audience="$(jq -r '.status.url' "$RUNNER_TEMP/service.json")"
+                printf '%s\t%s\t%s\t%s\n' "$resource" "$revision" "$url" "$audience" >>"$RUNNER_TEMP/candidates.tsv"
+                ;;
+            esac
+          done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
+
+      # The smoke job reaches internal-ingress services and IAP-fronted ones
+      # alike, which a GitHub runner can't. Its container sets no command, so
+      # these arguments are its whole command line, and gcloud's ^@^ prefix
+      # splits them on @, which the script must not contain.
+      - name: Smoke-test the candidates
+        env:
+          SMOKE_JOB: ${{ vars.SMOKE_JOB }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "$RUNNER_TEMP/candidates.tsv" ]; then
+            echo "No HTTP candidates to smoke-test."
+            exit 0
+          fi
+          read -r -d '' script <<'SMOKE' || true
+          set -euo pipefail
+          sha="$1"
+          shift
+          identity=http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity
+          while [ "$#" -gt 0 ]; do
+            url="$1"
+            audience="$2"
+            shift 2
+            token="$(curl -fsS -H 'Metadata-Flavor: Google' "$identity?audience=$audience")"
+            curl -fsS --retry 3 -o /dev/null -H "Authorization: Bearer $token" "$url/health"
+            version="$(curl -fsS --retry 3 -H "Authorization: Bearer $token" "$url/version")"
+            case "$version" in
+              *"sha-$sha"*) echo "$url is healthy at sha-$sha" ;;
+              *) echo "$url/version returned $version, not sha-$sha"; exit 1 ;;
+            esac
+          done
+          SMOKE
+          args="^@^bash@-c@$script@smoke@$SHA"
+          while IFS=$'\t' read -r _ _ url audience; do
+            args="$args@$url@$audience"
+          done <"$RUNNER_TEMP/candidates.tsv"
+          gcloud run jobs execute "$SMOKE_JOB" --args="$args" --wait
+
+      - name: Move traffic and jobs to the new image
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r resource revision _ _; do
+            previous="$(gcloud run services describe "$resource" --format=json \
+              | jq -r '[.status.traffic[] | select(.percent > 0) | "\(.revisionName)=\(.percent)"] | join(",")')"
+            gcloud run services update-traffic "$resource" --to-revisions="$revision=100" --quiet
+            printf 'cloud-run\t%s\t%s\n' "$resource" "$previous" >>"$RUNNER_TEMP/rollback.tsv"
+          done <"$RUNNER_TEMP/candidates.tsv"
+          while IFS=$'\t' read -r name kind; do
+            resource="$(jq -r --arg n "$name" '.[$n]' <<<"$DEPLOY_RESOURCES")"
+            case "$kind" in
+              cloud-run-job)
+                previous="$(gcloud run jobs describe "$resource" --format=json \
+                  | jq -r '.spec.template.spec.template.spec.containers[0].image')"
+                gcloud run jobs update "$resource" --image "$IMAGE" --quiet
+                printf 'cloud-run-job\t%s\t%s\n' "$resource" "$previous" >>"$RUNNER_TEMP/rollback.tsv"
+                ;;
+            esac
+          done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
+
+      # Only digests that passed smoke get an Environment tag, since every
+      # reader of a tag trusts it.
+      - name: Move the Environment tags
+        env:
+          TAG_PROD: ${{ inputs.tag-prod }}
+        run: |
+          set -euo pipefail
+          repository="${IMAGE%@*}"
+          tags=(dev)
+          if [ "$TAG_PROD" = true ]; then
+            tags+=(prod)
+          fi
+          for tag in "${tags[@]}"; do
+            # A tag's first move has nothing to go back to.
+            if previous="$(gcloud artifacts docker images describe "$repository:$tag" \
+              --format='value(image_summary.digest)' 2>/dev/null)"; then
+              printf 'tag\t%s\t%s\n' "$repository:$tag" "$repository@$previous" >>"$RUNNER_TEMP/rollback.tsv"
+            fi
+            gcloud artifacts docker tags add "$IMAGE" "$repository:$tag" --quiet
+          done
+
+      # A candidate that failed smoke never took traffic, so this undoes only
+      # what the steps after smoke changed.
+      - name: Roll back
+        if: failure()
+        run: |
+          set -uo pipefail
+          [ -f "$RUNNER_TEMP/rollback.tsv" ] || exit 0
+          failed=0
+          while IFS=$'\t' read -r kind resource previous; do
+            case "$kind" in
+              cloud-run) gcloud run services update-traffic "$resource" --to-revisions="$previous" --quiet || failed=1 ;;
+              cloud-run-job) gcloud run jobs update "$resource" --image "$previous" --quiet || failed=1 ;;
+              tag) gcloud artifacts docker tags add "$previous" "$resource" --quiet || failed=1 ;;
+            esac
+          done <"$RUNNER_TEMP/rollback.tsv"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::The rollback failed; restore the previous revisions, job images, and tags by hand."
+          fi
+          exit "$failed"
