@@ -13,6 +13,24 @@ name: Deliver
 #   DEPLOY_RESOURCES            a JSON object naming, for each target and the
 #                               migrations job, its resource in the Environment
 #   SMOKE_JOB                   the Environment's smoke Cloud Run job
+#   SMOKE_DEVICE                with smoke-device, the repo's Smoke Device in
+#                               the Environment, whose bootstrap PSK and
+#                               device key are its Secret Manager secrets
+#                               <SMOKE_DEVICE>-bootstrap-psk and
+#                               <SMOKE_DEVICE>-device-key
+#   CI_READER_WIF_PROVIDER      with smoke-device, the read-only CI identity's
+#   CI_READER_SERVICE_ACCOUNT   Workload Identity provider and account, which
+#                               fetch the Smoke Device's firmware
+#
+# With smoke-device, each deploy ends by running local-stack's smoke suite,
+# `smoke/run.sh` from its main branch, with the deploy's Environment in
+# SMOKE_ENVIRONMENT, the Device's ID in SMOKE_DEVICE_ID, files holding its
+# keys in SMOKE_BOOTSTRAP_PSK_FILE and SMOKE_DEVICE_KEY_FILE, the
+# Environment's smoke client secret in SMOKE_CLIENT_SECRET, and the read-only
+# CI identity, in place of the deploy identity, as its Google credentials.
+# The suite exits non-zero when any check fails, and the deploy then rolls
+# back. A Smoke Device that isn't in service yet fails every run, so a caller
+# turns smoke-device on once its Smoke Device passes a run.
 #
 # An instance-group target is a regional managed instance group that
 # autoheals on the health check its load balancer uses. Its instance
@@ -74,6 +92,20 @@ on:
         required: false
         type: boolean
         default: true
+      smoke-device:
+        description: >-
+          End each deploy by running the repo's Smoke Device, which the
+          environment's SMOKE_DEVICE names, through the smoke suite.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      smoke-client-secret:
+        description: With smoke-device, the dev smoke client's secret.
+        required: false
+      local-stack-token:
+        description: With smoke-device, a token that can read Prevasum/local-stack.
+        required: false
     outputs:
       image:
         description: The image built, by digest.
@@ -100,8 +132,24 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           MIGRATIONS: ${{ inputs.migrations }}
           DEPLOY_RESOURCES: ${{ vars.DEPLOY_RESOURCES }}
+          SMOKE_DEVICE_ON: ${{ inputs.smoke-device }}
+          SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
+          CI_READER_WIF_PROVIDER: ${{ vars.CI_READER_WIF_PROVIDER }}
+          CI_READER_SERVICE_ACCOUNT: ${{ vars.CI_READER_SERVICE_ACCOUNT }}
+          HAS_SMOKE_CLIENT_SECRET: ${{ secrets.smoke-client-secret != '' }}
+          HAS_LOCAL_STACK_TOKEN: ${{ secrets.local-stack-token != '' }}
         run: |
           set -euo pipefail
+          if [ "$SMOKE_DEVICE_ON" = true ]; then
+            for setting in SMOKE_DEVICE CI_READER_WIF_PROVIDER CI_READER_SERVICE_ACCOUNT; do
+              [ -n "${!setting}" ] \
+                || { echo "::error::smoke-device needs $setting in the environment"; exit 1; }
+            done
+            [ "$HAS_SMOKE_CLIENT_SECRET" = true ] \
+              || { echo "::error::smoke-device needs the smoke-client-secret secret"; exit 1; }
+            [ "$HAS_LOCAL_STACK_TOKEN" = true ] \
+              || { echo "::error::smoke-device needs the local-stack-token secret"; exit 1; }
+          fi
           jq -e 'type == "array" and length > 0' <<<"$TARGETS" >/dev/null \
             || { echo "::error::targets must be a non-empty JSON list"; exit 1; }
           jq -e 'type == "object"' <<<"${DEPLOY_RESOURCES:-null}" >/dev/null \
@@ -166,8 +214,13 @@ jobs:
     if: needs.build.outputs.dev-targets != '[]'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+    # A Smoke Device can play only one run at a time, and one repo can
+    # deploy several services, so with one every deploy from the repo to the
+    # Environment takes its turn in the Smoke Device's group. The deploy and
+    # the Smoke Device's run stay one job, so a newer deploy never lands
+    # between this deploy and its check, or under its rollback.
     concurrency:
-      group: deliver-${{ inputs.service }}
+      group: ${{ inputs.smoke-device && 'smoke-device-dev' || format('deliver-{0}', inputs.service) }}
       cancel-in-progress: false
     env:
       IMAGE: ${{ needs.build.outputs.image }}
@@ -430,6 +483,76 @@ jobs:
                 ;;
             esac
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
+
+      # The Smoke Device checks in through the Server as it now serves, so it
+      # runs once every target has the new image.
+      - name: Read the Smoke Device's keys
+        if: inputs.smoke-device
+        env:
+          SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/smoke-device"
+          for key in bootstrap-psk device-key; do
+            if ! gcloud secrets versions access latest --secret "$SMOKE_DEVICE-$key" \
+              --out-file "$RUNNER_TEMP/smoke-device/$key"; then
+              rm -rf "$RUNNER_TEMP/smoke-device"
+              echo "::error::Can't read $SMOKE_DEVICE's $key, so the Smoke Device can't run. Is it Provisioned, with its keys stored?"
+              exit 1
+            fi
+            while IFS= read -r line || [ -n "$line" ]; do
+              [ -z "$line" ] || echo "::add-mask::$line"
+            done <"$RUNNER_TEMP/smoke-device/$key"
+          done
+
+      - name: Authenticate the smoke suite
+        id: ci-reader
+        if: inputs.smoke-device
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.CI_READER_WIF_PROVIDER }}
+          service_account: ${{ vars.CI_READER_SERVICE_ACCOUNT }}
+          # The later steps keep the deploy identity.
+          export_environment_variables: false
+
+      - name: Check out the smoke suite
+        if: inputs.smoke-device
+        uses: actions/checkout@v4
+        with:
+          repository: Prevasum/local-stack
+          ref: main
+          token: ${{ secrets.local-stack-token }}
+          path: local-stack
+          persist-credentials: false
+
+      - name: Run the Smoke Device
+        if: inputs.smoke-device
+        env:
+          SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
+          SMOKE_CLIENT_SECRET: ${{ secrets.smoke-client-secret }}
+          CI_READER_CREDENTIALS: ${{ steps.ci-reader.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          # The bound keeps a hung run from holding the Smoke Device's group;
+          # the suite's own waits are far shorter.
+          status=0
+          env -u GOOGLE_GHA_CREDS_PATH -u CLOUDSDK_CORE_PROJECT -u CLOUDSDK_PROJECT \
+            -u GCLOUD_PROJECT -u GCP_PROJECT -u GOOGLE_CLOUD_PROJECT \
+            -u CLOUDSDK_RUN_REGION -u CLOUDSDK_COMPUTE_REGION \
+            GOOGLE_APPLICATION_CREDENTIALS="$CI_READER_CREDENTIALS" \
+            CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$CI_READER_CREDENTIALS" \
+            SMOKE_ENVIRONMENT=dev \
+            SMOKE_DEVICE_ID="$SMOKE_DEVICE" \
+            SMOKE_BOOTSTRAP_PSK_FILE="$RUNNER_TEMP/smoke-device/bootstrap-psk" \
+            SMOKE_DEVICE_KEY_FILE="$RUNNER_TEMP/smoke-device/device-key" \
+            timeout 600 bash local-stack/smoke/run.sh || status=$?
+          rm -rf "$RUNNER_TEMP/smoke-device"
+          case "$status" in
+            0) echo "$SMOKE_DEVICE passed the smoke suite" ;;
+            124) echo "::error::The smoke suite didn't finish within 10 minutes."; exit 1 ;;
+            *) echo "::error::$SMOKE_DEVICE failed the smoke suite."; exit 1 ;;
+          esac
 
       # Only digests that passed smoke get an Environment tag, since every
       # reader of a tag trusts it.
