@@ -106,6 +106,11 @@ on:
       local-stack-token:
         description: With smoke-device, a token that can read Prevasum/local-stack.
         required: false
+      oncall-webhook:
+        description: >-
+          The incoming webhook of the Server on-call Chat space, which a run
+          that fails or rolls back posts to.
+        required: false
     outputs:
       image:
         description: The image built, by digest.
@@ -222,6 +227,8 @@ jobs:
     concurrency:
       group: ${{ inputs.smoke-device && 'smoke-device-dev' || format('deliver-{0}', inputs.service) }}
       cancel-in-progress: false
+    outputs:
+      rollback: ${{ steps.rollback.outputs.rollback }}
     env:
       IMAGE: ${{ needs.build.outputs.image }}
       TARGETS: ${{ needs.build.outputs.dev-targets }}
@@ -578,10 +585,14 @@ jobs:
       # A candidate that failed smoke never took traffic, so this undoes only
       # what the steps after smoke changed.
       - name: Roll back
+        id: rollback
         if: failure()
         run: |
           set -uo pipefail
-          [ -f "$RUNNER_TEMP/rollback.tsv" ] || exit 0
+          if [ ! -s "$RUNNER_TEMP/rollback.tsv" ]; then
+            echo "rollback=none" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
           failed=0
           while IFS=$'\t' read -r kind resource previous; do
             case "$kind" in
@@ -603,6 +614,46 @@ jobs:
             esac
           done <"$RUNNER_TEMP/rollback.tsv"
           if [ "$failed" -ne 0 ]; then
+            echo "rollback=failed" >>"$GITHUB_OUTPUT"
             echo "::error::The rollback failed; restore the previous revisions, job and worker pool images, instance templates, and tags by hand."
+          else
+            echo "rollback=done" >>"$GITHUB_OUTPUT"
           fi
           exit "$failed"
+
+  # A run can't fail or roll back without a needed job failing. A cancelled
+  # run, replaced by a newer pending one, is neither.
+  notify:
+    needs: [build, dev]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Server on-call
+        env:
+          WEBHOOK: ${{ secrets.oncall-webhook }}
+          SERVICE: ${{ inputs.service }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          BUILD: ${{ needs.build.result }}
+          ROLLBACK: ${{ needs.dev.outputs.rollback }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD" = failure ]; then
+            what="didn't build, so nothing was deployed"
+          else
+            case "$ROLLBACK" in
+              done) what="failed in dev and was rolled back" ;;
+              failed) what="failed in dev, and its rollback failed too: restore dev by hand" ;;
+              *) what="failed in dev with nothing to roll back" ;;
+            esac
+          fi
+          text="Deploy of $SERVICE from $REPOSITORY at ${SHA:0:7} $what. $RUN_URL"
+          echo "$text"
+          if [ -z "$WEBHOOK" ]; then
+            echo "::warning::No oncall-webhook secret, so nothing was posted to Server on-call."
+            exit 0
+          fi
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -fsS --retry 3 -o /dev/null -H 'Content-Type: application/json; charset=UTF-8' \
+              --data @- "$WEBHOOK"
