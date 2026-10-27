@@ -38,6 +38,22 @@ name: Deliver
 # instance, once its container starts, writes that container's image by
 # digest to its guest attribute `container/image`.
 #
+# With build-only, the run builds the image once, pushes `sha-<sha>`, and
+# moves `:prod` to that digest, and does nothing else: no deploy, migrations,
+# smoke test, or rollback, and `:dev` stays where it is, since nothing was
+# deployed to dev. It needs only GCP_WIF_PROVIDER, GCP_DEPLOY_SERVICE_ACCOUNT,
+# IMAGE_REPOSITORY, and GCP_PROJECT; `targets` may be `[]`, `tag-prod` is
+# ignored, and `migrations` and `smoke-device` have no effect. A `:prod` set
+# this way was NOT smoke-tested. The repo's pre-merge end-to-end check, which
+# its CI requires, stands in for the gate until the repo deploys through an
+# instance-group target.
+#
+# A repo whose Docker context needs a private submodule, such as `proto`,
+# sets `submodules` to `true` or `recursive` and passes `checkout-token`, a
+# token that can read it. The checkout then uses that token, and clones an
+# SSH-form submodule URL over HTTPS with it. Without them the checkout is the
+# repo alone, with the workflow's own token.
+#
 # The caller grants `contents: read` and `id-token: write`, since a called
 # workflow can't hold more than its caller.
 
@@ -53,7 +69,8 @@ on:
           A JSON list of deploy targets, each {"name": ..., "kind": ...}, all
           deployed from the one image. Kinds: cloud-run, cloud-run-job,
           worker-pool, instance-group. A target with "prod-only": true runs
-          outside every Environment, so this only builds its image.
+          outside every Environment, so this only builds its image. With
+          build-only, [] is allowed and the list is otherwise ignored.
         required: true
         type: string
       migrations:
@@ -99,7 +116,28 @@ on:
         required: false
         type: boolean
         default: false
+      build-only:
+        description: >-
+          Build the image and move :prod to it, with no deploy, migrations,
+          smoke test, or rollback, and never :dev. Ignores tag-prod. For a
+          repo not yet deploying through this workflow, so readers have a
+          :prod image to resolve.
+        required: false
+        type: boolean
+        default: false
+      submodules:
+        description: >-
+          Check out submodules for the build: '' for none, 'true', or
+          'recursive'. A private one needs the checkout-token secret.
+        required: false
+        type: string
+        default: ""
     secrets:
+      checkout-token:
+        description: >-
+          A token that can read the repo's private submodules, used for the
+          build's checkout in place of the workflow's own token.
+        required: false
       smoke-client-secret:
         description: With smoke-device, the dev smoke client's secret.
         required: false
@@ -137,6 +175,7 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           MIGRATIONS: ${{ inputs.migrations }}
           DEPLOY_RESOURCES: ${{ vars.DEPLOY_RESOURCES }}
+          BUILD_ONLY: ${{ inputs.build-only }}
           SMOKE_DEVICE_ON: ${{ inputs.smoke-device }}
           SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
           CI_READER_WIF_PROVIDER: ${{ vars.CI_READER_WIF_PROVIDER }}
@@ -145,6 +184,13 @@ jobs:
           HAS_LOCAL_STACK_TOKEN: ${{ secrets.local-stack-token != '' }}
         run: |
           set -euo pipefail
+          # Nothing deploys, so there are no targets or resources to check.
+          if [ "$BUILD_ONLY" = true ]; then
+            jq -e 'type == "array"' <<<"$TARGETS" >/dev/null \
+              || { echo "::error::targets must be a JSON list"; exit 1; }
+            echo "dev-targets=[]" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$SMOKE_DEVICE_ON" = true ]; then
             for setting in SMOKE_DEVICE CI_READER_WIF_PROVIDER CI_READER_SERVICE_ACCOUNT; do
               [ -n "${!setting}" ] \
@@ -177,6 +223,9 @@ jobs:
           exit "$failed"
 
       - uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules }}
+          token: ${{ secrets.checkout-token || github.token }}
 
       - uses: google-github-actions/auth@v2
         with:
@@ -216,7 +265,7 @@ jobs:
 
   dev:
     needs: build
-    if: needs.build.outputs.dev-targets != '[]'
+    if: inputs.build-only == false && needs.build.outputs.dev-targets != '[]'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     # A Smoke Device can play only one run at a time, and one repo can
@@ -621,10 +670,44 @@ jobs:
           fi
           exit "$failed"
 
+  # Only :prod moves, and to a digest nothing deployed, so there is nothing to
+  # roll back: a failed move leaves :prod where it was.
+  publish-prod:
+    needs: build
+    if: inputs.build-only
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deliver-${{ inputs.service }}
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Move :prod
+        run: |
+          set -euo pipefail
+          repository="${IMAGE%@*}"
+          # A tag's first move has no previous digest.
+          if previous="$(gcloud artifacts docker images describe "$repository:prod" \
+            --format='value(image_summary.digest)' 2>/dev/null)"; then
+            echo "Moved $repository:prod from $previous to ${IMAGE##*@}" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "Set $repository:prod to ${IMAGE##*@}" >>"$GITHUB_STEP_SUMMARY"
+          fi
+          gcloud artifacts docker tags add "$IMAGE" "$repository:prod" --quiet
+
   # A run can't fail or roll back without a needed job failing. A cancelled
   # run, replaced by a newer pending one, is neither.
   notify:
-    needs: [build, dev]
+    needs: [build, dev, publish-prod]
     if: failure()
     runs-on: ubuntu-latest
     steps:
@@ -636,11 +719,14 @@ jobs:
           SHA: ${{ github.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           BUILD: ${{ needs.build.result }}
+          PUBLISH: ${{ needs.publish-prod.result }}
           ROLLBACK: ${{ needs.dev.outputs.rollback }}
         run: |
           set -euo pipefail
           if [ "$BUILD" = failure ]; then
             what="didn't build, so nothing was deployed"
+          elif [ "$PUBLISH" = failure ]; then
+            what="built, but moving :prod failed"
           else
             case "$ROLLBACK" in
               done) what="failed in dev and was rolled back" ;;
