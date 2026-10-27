@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Pre-commit gate for Prevasum/.github. Runs the same check as the `actionlint`
+# job in `.github/workflows/ci.yml`.
+#
+# Enable once per clone:
+#
+#     git config core.hooksPath .githooks
+
+set -euo pipefail
+
+if ! git diff --cached --quiet -- .github/workflows; then
+  echo "==> actionlint"
+  if ! command -v actionlint >/dev/null; then
+    echo "Error: actionlint is not installed. Install release 1.7.12 or newer:"
+    echo "  macOS:  brew install actionlint"
+    echo "  Linux:  https://github.com/rhysd/actionlint/blob/main/docs/install.md"
+    echo "Commit aborted."
+    exit 1
+  fi
+  actionlint || {
+    echo "Error: actionlint failed. Commit aborted."
+    exit 1
+  }
+fi

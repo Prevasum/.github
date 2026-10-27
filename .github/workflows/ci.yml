@@ -1,0 +1,52 @@
+name: CI
+
+# Lints this repo's own workflows, which the org's `pr-checks` workflows and
+# the reusable ones other repos call run from. `ci-ok` is the one check the
+# `required-ci` ruleset will require.
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        run: |
+          if git diff --quiet "origin/${{ github.base_ref }}...HEAD" -- ':!*.md'; then
+            echo "code=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "code=true" >>"$GITHUB_OUTPUT"
+          fi
+
+  actionlint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/actionlint.yml
+
+  ci-ok:
+    needs: [changes, actionlint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any check failed or was cancelled
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if grep -qE '"(failure|cancelled)"' <<<"$RESULTS"; then
+            exit 1
+          fi
