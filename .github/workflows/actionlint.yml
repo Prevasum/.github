@@ -1,0 +1,57 @@
+name: Actionlint
+
+# A repo calls this to lint its own `.github/workflows/` with actionlint, so
+# a mistake in a workflow that runs only on push to `main` fails the PR
+# instead of the first deploy. Call it from the repo's CI and make `ci-ok`
+# need the job:
+#
+#   actionlint:
+#     needs: changes
+#     if: needs.changes.outputs.code == 'true'
+#     permissions:
+#       contents: read
+#     uses: Prevasum/.github/.github/workflows/actionlint.yml@main
+#
+# The release is pinned here by version and SHA-256, so bumping it is one
+# change in this file. Bump the version in the pre-commit snippet with it:
+# `hooks/actionlint-pre-commit.sh` names the same release.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONLINT_VERSION: 1.7.12
+  # SHA-256 of actionlint_<version>_linux_amd64.tar.gz, from the release's
+  # checksums file.
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    # A reusable workflow takes no workflow-level concurrency block, since
+    # `github.workflow` is the caller's name there.
+    concurrency:
+      group: actionlint-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$archive"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint" actionlint
+
+      # The runner image has shellcheck, which actionlint runs on every
+      # `run:` step.
+      - name: Lint the workflows
+        run: '"$RUNNER_TEMP/actionlint/actionlint" -color'
