@@ -29,7 +29,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          count="$(gh pr view "$PR" -R "$REPO" --json commits -q '.commits | length')"
+          count="$(gh api "repos/$REPO/pulls/$PR" -q .commits)"
           if [ "$count" -eq 1 ]; then
             echo "PR has one commit"
             exit 0
