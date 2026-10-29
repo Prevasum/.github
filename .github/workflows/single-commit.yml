@@ -1,0 +1,38 @@
+name: PR Single Commit Validation
+
+# The `pr-checks` org ruleset runs this on every repo's PRs into its
+# default branch, so no repo needs its own copy. A ruleset can't count a
+# PR's commits, so this check is what holds a PR to one commit.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate-single-commit:
+    # Bot PRs are exempt: release-please and openapi-sync write their own
+    # branches, and no author is there to squash them. A skipped job counts
+    # as passing, so they can still merge.
+    if: ${{ !startsWith(github.head_ref, 'release-please--') && !startsWith(github.head_ref, 'openapi-sync--') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR Single Commit Validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          count="$(gh pr view "$PR" -R "$REPO" --json commits -q '.commits | length')"
+          if [ "$count" -eq 1 ]; then
+            echo "PR has one commit"
+            exit 0
+          fi
+          echo "::error::The PR has $count commits and must have one. Squash them into one commit (git reset --soft \$(git merge-base HEAD origin/<default branch>) && git commit), or amend review changes into it with git commit --amend, then git push --force-with-lease. See 'One commit per PR' in CODING_STANDARDS.md in Prevasum/docs."
+          exit 1
