@@ -21,10 +21,12 @@ Categories are GitHub issue types, set on the Prevasum org, not labels. Set one 
 | `ready-for-human` | `status: ready-for-human` | Requires human implementation            |
 | `wontfix`         | `status: wontfix`         | Will not be actioned. Also close the issue with `--reason "not planned"` |
 
-State labels share the `status:` prefix, matching the repos' other prefixed labels (`api:`, `cloud:`, `service:`). An issue carries exactly one. Quote the name in commands, since it contains a space: `gh issue edit 42 --add-label "status: ready-for-agent"`.
+State labels share the `status:` prefix. An issue carries exactly one state label. Quote the name in commands, since it contains a space: `gh issue edit 42 --add-label "status: ready-for-agent"`.
 
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 
 ## Area labels
 
-This repo also has area labels (for example `fota`, `api: device`, `cloud: firestore`). When triaging, suggest the ones that fit from `gh label list`. Don't invent new ones.
+This repo has no area labels. If one would help, suggest it, using a prefix from the label table named below, but don't create it.
+
+Every Prevasum repo uses the same label prefixes and colours, set by the label table in the `docs` repo's `CODING_STANDARDS.md`.
