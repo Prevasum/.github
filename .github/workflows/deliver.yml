@@ -12,6 +12,11 @@ name: Deliver
 #   IMAGE_REPOSITORY            the service's repository in the image registry
 #   DEPLOY_RESOURCES            a JSON object naming, for each target and the
 #                               migrations job, its resource in the Environment
+#   DEPLOY_ENV                  optional: a JSON object giving, for a
+#                               cloud-run target, the environment its
+#                               revisions run with, as
+#                               {"vars": {NAME: value},
+#                                "secrets": {NAME: "secret:version"}}
 #   SMOKE_JOB                   the Environment's smoke Cloud Run job
 #   SMOKE_DEVICE                with smoke-device, the repo's Smoke Device in
 #                               the Environment, whose bootstrap PSK and
@@ -31,6 +36,13 @@ name: Deliver
 # The suite exits non-zero when any check fails, and the deploy then rolls
 # back. A Smoke Device that isn't in service yet fails every run, so a caller
 # turns smoke-device on once its Smoke Device passes a run.
+#
+# A cloud-run target with a DEPLOY_ENV entry deploys its candidate with
+# exactly the entry's variables and secrets, replacing the ones the serving
+# revision has, so a change to them goes through the smoke test like a new
+# image does. The entry owns every literal variable and every secret, mounted
+# ones included, so an empty "vars" or "secrets" clears them. A target with
+# no entry copies the serving revision's.
 #
 # An instance-group target is a regional managed instance group that
 # autoheals on the health check its load balancer uses, or, for a service
@@ -184,6 +196,7 @@ jobs:
           TARGETS: ${{ inputs.targets }}
           MIGRATIONS: ${{ inputs.migrations }}
           DEPLOY_RESOURCES: ${{ vars.DEPLOY_RESOURCES }}
+          DEPLOY_ENV: ${{ vars.DEPLOY_ENV }}
           BUILD_ONLY: ${{ inputs.build-only }}
           SMOKE_DEVICE_ON: ${{ inputs.smoke-device }}
           SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
@@ -243,6 +256,26 @@ jobs:
             echo "::error::DEPLOY_RESOURCES names no resource for $name"
             failed=1
           done
+          # Both keys are required, since a missing one would clear what the
+          # revision has. A secret is joined into gcloud's NAME=SECRET:VERSION
+          # list, so neither part may hold a comma or an equals sign.
+          if [ -n "$DEPLOY_ENV" ]; then
+            if jq -e 'type == "object" and all(.[];
+                  type == "object" and has("vars") and has("secrets")
+                  and (.vars | type == "object" and all(.[]; type == "string"))
+                  and (.secrets | type == "object"
+                    and all(to_entries[]; (.key | test("^[^,=]+$"))
+                      and (.value | type == "string" and test("^[^,=:]+:[^,=:]+$")))))' \
+                <<<"$DEPLOY_ENV" >/dev/null; then
+              for name in $(jq -r 'keys[]' <<<"$DEPLOY_ENV"); do
+                jq -e --arg n "$name" 'any(.[]; .name == $n and .kind == "cloud-run")' <<<"$dev_targets" >/dev/null \
+                  || echo "::warning::DEPLOY_ENV has an entry for $name, which is no cloud-run target here, so no deploy uses it"
+              done
+            else
+              echo '::error::DEPLOY_ENV must map each cloud-run target to {"vars": {NAME: value}, "secrets": {NAME: "secret:version"}}'
+              failed=1
+            fi
+          fi
           echo "dev-targets=$dev_targets" >>"$GITHUB_OUTPUT"
           exit "$failed"
 
@@ -307,6 +340,7 @@ jobs:
       IMAGE: ${{ needs.build.outputs.image }}
       TARGETS: ${{ needs.build.outputs.dev-targets }}
       DEPLOY_RESOURCES: ${{ vars.DEPLOY_RESOURCES }}
+      DEPLOY_ENV: ${{ vars.DEPLOY_ENV }}
       CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT }}
       CLOUDSDK_RUN_REGION: ${{ vars.GCP_REGION }}
       CLOUDSDK_COMPUTE_REGION: ${{ vars.GCP_REGION }}
@@ -341,7 +375,27 @@ jobs:
             resource="$(jq -r --arg n "$name" '.[$n]' <<<"$DEPLOY_RESOURCES")"
             case "$kind" in
               cloud-run)
-                gcloud run deploy "$resource" --image "$IMAGE" \
+                # Without an entry, gcloud copies the serving revision's
+                # environment, as it always has.
+                env_flags=()
+                entry="$(jq -c --arg n "$name" '.[$n] // empty' <<<"${DEPLOY_ENV:-null}")"
+                if [ -n "$entry" ]; then
+                  if jq -e '.vars == {}' <<<"$entry" >/dev/null; then
+                    env_flags+=(--clear-env-vars)
+                  else
+                    # A file, because a value may hold the commas that
+                    # --set-env-vars splits on.
+                    jq '.vars' <<<"$entry" >"$RUNNER_TEMP/env-vars.yaml"
+                    env_flags+=(--env-vars-file "$RUNNER_TEMP/env-vars.yaml")
+                  fi
+                  secrets="$(jq -r '.secrets | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$entry")"
+                  if [ -n "$secrets" ]; then
+                    env_flags+=(--set-secrets "$secrets")
+                  else
+                    env_flags+=(--clear-secrets)
+                  fi
+                fi
+                gcloud run deploy "$resource" --image "$IMAGE" "${env_flags[@]}" \
                   --no-traffic --tag candidate --quiet
                 gcloud run services describe "$resource" --format=json >"$RUNNER_TEMP/service.json"
                 revision="$(jq -r '.status.traffic[] | select(.tag == "candidate") | .revisionName' "$RUNNER_TEMP/service.json")"
