@@ -33,7 +33,9 @@ name: Deliver
 # turns smoke-device on once its Smoke Device passes a run.
 #
 # An instance-group target is a regional managed instance group that
-# autoheals on the health check its load balancer uses. Its instance
+# autoheals on the health check its load balancer uses, or, for a service
+# run as several nodes, a DEPLOY_RESOURCES list of one group per node, which
+# deploy one after another, each replacing its instance in place. Its instance
 # template's metadata `image` names the image its instances run, and each
 # instance, once its container starts, writes that container's image by
 # digest to its guest attribute `container/image`.
@@ -230,7 +232,16 @@ jobs:
             || { echo "::error::DEPLOY_RESOURCES must be a JSON object in the environment"; exit 1; }
           for name in $(jq -r '.[].name' <<<"$dev_targets") $MIGRATIONS; do
             jq -e --arg n "$name" '.[$n] | type == "string"' <<<"$DEPLOY_RESOURCES" >/dev/null \
-              || { echo "::error::DEPLOY_RESOURCES names no resource for $name"; failed=1; }
+              && continue
+            # Only an instance-group target may name several, one per node.
+            if jq -e --arg n "$name" 'map(select(.name == $n and .kind == "instance-group")) | length > 0' \
+                <<<"$dev_targets" >/dev/null \
+              && jq -e --arg n "$name" '.[$n] | type == "array" and length > 0 and all(.[]; type == "string")' \
+                <<<"$DEPLOY_RESOURCES" >/dev/null; then
+              continue
+            fi
+            echo "::error::DEPLOY_RESOURCES names no resource for $name"
+            failed=1
           done
           echo "dev-targets=$dev_targets" >>"$GITHUB_OUTPUT"
           exit "$failed"
@@ -457,6 +468,22 @@ jobs:
               sleep 10
             done
           }
+
+          # Prints the max surge and max unavailable for a rolling update of
+          # the group described in $2: an instance-group surges a new instance
+          # first, and an instance-group-node replaces its one instance in
+          # place, since its node ID may be held by one instance at a time. A
+          # regional group refuses a fixed number other than 0 below its zone
+          # count, so the nonzero one is that count.
+          update_limits() {
+            local zones
+            zones="$(jq '[.distributionPolicy.zones[]?] | length | if . == 0 then 1 else . end' "$2")"
+            if [ "$1" = instance-group-node ]; then
+              echo "0 $zones"
+            else
+              echo "$zones 0"
+            fi
+          }
           HELPERS
           # shellcheck source=/dev/null
           . "$RUNNER_TEMP/instance-group.sh"
@@ -465,72 +492,82 @@ jobs:
           digest="${IMAGE##*@}"
           while IFS=$'\t' read -r name kind; do
             [ "$kind" = instance-group ] || continue
-            group="$(jq -r --arg n "$name" '.[$n]' <<<"$DEPLOY_RESOURCES")"
-            current="$(gcloud compute instance-groups managed describe "$group" \
-              --region "$CLOUDSDK_COMPUTE_REGION" --format=json \
-              | jq -r 'if (.versions | length) == 1 then .versions[0].instanceTemplate else empty end')"
-            if [ -z "$current" ]; then
-              echo "::error::$group isn't on exactly one instance template."
-              exit 1
-            fi
-
-            # A rerun of the same digest finds its template already made.
-            hex="${digest#sha256:}"
-            template_name="${group:0:50}"
-            template_name="${template_name%-}-${hex:0:12}"
-            template="${current%/*}/$template_name"
-            status="$(curl -sS -o "$RUNNER_TEMP/template.json" -w '%{http_code}' "${auth[@]}" "$template")"
-            if [ "$status" = 404 ]; then
-              curl -fsS "${auth[@]}" "$current" >"$RUNNER_TEMP/current.json"
-              jq -e '[.properties.metadata.items[]? | select(.key == "image")] | length == 1' \
-                "$RUNNER_TEMP/current.json" >/dev/null \
-                || { echo "::error::$current has no image metadata."; exit 1; }
-              jq --arg name "$template_name" --arg image "$IMAGE" '
-                {name: $name, properties: (.properties
-                  | .metadata.items |= map(if .key == "image" then .value = $image else . end)
-                  | del(.metadata.fingerprint))}' \
-                "$RUNNER_TEMP/current.json" >"$RUNNER_TEMP/template.json"
-              operation="$(curl -fsS "${auth[@]}" --data @"$RUNNER_TEMP/template.json" "${current%/*}" | jq -r .selfLink)"
-              # Each wait call returns when the operation is done or after
-              # about 2 minutes, whichever is first.
-              while :; do
-                curl -fsS "${auth[@]}" -X POST "$operation/wait" >"$RUNNER_TEMP/operation.json"
-                jq -e '.status == "DONE"' "$RUNNER_TEMP/operation.json" >/dev/null && break
-              done
-              if jq -e '.error' "$RUNNER_TEMP/operation.json" >/dev/null; then
-                echo "::error::Creating $template failed: $(jq -c .error "$RUNNER_TEMP/operation.json")"
+            # A service with several nodes lists their groups, and each node
+            # ID may be held by one instance at a time, so each group replaces
+            # its instance in place, surge 0, and the next starts only once
+            # this one's new instance is healthy. One group keeps surge.
+            mapfile -t groups < <(jq -r --arg n "$name" \
+              '.[$n] | if type == "array" then .[] else . end' <<<"$DEPLOY_RESOURCES")
+            if [ "${#groups[@]}" -gt 1 ]; then record="instance-group-node"; else record="instance-group"; fi
+            for group in "${groups[@]}"; do
+              gcloud compute instance-groups managed describe "$group" \
+                --region "$CLOUDSDK_COMPUTE_REGION" --format=json >"$RUNNER_TEMP/group.json"
+              current="$(jq -r 'if (.versions | length) == 1 then .versions[0].instanceTemplate else empty end' \
+                "$RUNNER_TEMP/group.json")"
+              if [ -z "$current" ]; then
+                echo "::error::$group isn't on exactly one instance template."
                 exit 1
               fi
-            elif [ "$status" = 200 ]; then
-              jq -e --arg image "$IMAGE" '[.properties.metadata.items[]? | select(.key == "image") | .value] == [$image]' \
-                "$RUNNER_TEMP/template.json" >/dev/null \
-                || { echo "::error::$template exists with another image."; exit 1; }
-            else
-              echo "::error::Reading $template returned HTTP $status."
-              exit 1
-            fi
+              read -r surge unavailable < <(update_limits "$record" "$RUNNER_TEMP/group.json")
 
-            gcloud compute instance-groups managed rolling-action start-update "$group" \
-              --region "$CLOUDSDK_COMPUTE_REGION" --version=template="$template" \
-              --max-surge=1 --max-unavailable=0 --quiet
-            printf 'instance-group\t%s\t%s\n' "$group" "$current" >>"$RUNNER_TEMP/rollback.tsv"
-            instance="$(healthy_instance "$group" "$template" 240)" \
-              || { echo "::error::No instance of $group on $template was healthy within 4 minutes."; exit 1; }
-
-            zone="$(sed -E 's|.*/zones/([^/]+)/.*|\1|' <<<"$instance")"
-            running=""
-            for _ in 1 2 3 4 5 6; do
-              if running="$(gcloud compute instances get-guest-attributes "${instance##*/}" --zone "$zone" \
-                --query-path=container/image --format='value(value)' 2>/dev/null)" && [ -n "$running" ]; then
-                break
+              # A rerun of the same digest finds its template already made.
+              hex="${digest#sha256:}"
+              template_name="${group:0:50}"
+              template_name="${template_name%-}-${hex:0:12}"
+              template="${current%/*}/$template_name"
+              status="$(curl -sS -o "$RUNNER_TEMP/template.json" -w '%{http_code}' "${auth[@]}" "$template")"
+              if [ "$status" = 404 ]; then
+                curl -fsS "${auth[@]}" "$current" >"$RUNNER_TEMP/current.json"
+                jq -e '[.properties.metadata.items[]? | select(.key == "image")] | length == 1' \
+                  "$RUNNER_TEMP/current.json" >/dev/null \
+                  || { echo "::error::$current has no image metadata."; exit 1; }
+                jq --arg name "$template_name" --arg image "$IMAGE" '
+                  {name: $name, properties: (.properties
+                    | .metadata.items |= map(if .key == "image" then .value = $image else . end)
+                    | del(.metadata.fingerprint))}' \
+                  "$RUNNER_TEMP/current.json" >"$RUNNER_TEMP/template.json"
+                operation="$(curl -fsS "${auth[@]}" --data @"$RUNNER_TEMP/template.json" "${current%/*}" | jq -r .selfLink)"
+                # Each wait call returns when the operation is done or after
+                # about 2 minutes, whichever is first.
+                while :; do
+                  curl -fsS "${auth[@]}" -X POST "$operation/wait" >"$RUNNER_TEMP/operation.json"
+                  jq -e '.status == "DONE"' "$RUNNER_TEMP/operation.json" >/dev/null && break
+                done
+                if jq -e '.error' "$RUNNER_TEMP/operation.json" >/dev/null; then
+                  echo "::error::Creating $template failed: $(jq -c .error "$RUNNER_TEMP/operation.json")"
+                  exit 1
+                fi
+              elif [ "$status" = 200 ]; then
+                jq -e --arg image "$IMAGE" '[.properties.metadata.items[]? | select(.key == "image") | .value] == [$image]' \
+                  "$RUNNER_TEMP/template.json" >/dev/null \
+                  || { echo "::error::$template exists with another image."; exit 1; }
+              else
+                echo "::error::Reading $template returned HTTP $status."
+                exit 1
               fi
-              sleep 5
+
+              gcloud compute instance-groups managed rolling-action start-update "$group" \
+                --region "$CLOUDSDK_COMPUTE_REGION" --version=template="$template" \
+                --max-surge="$surge" --max-unavailable="$unavailable" --quiet
+              printf '%s\t%s\t%s\n' "$record" "$group" "$current" >>"$RUNNER_TEMP/rollback.tsv"
+              instance="$(healthy_instance "$group" "$template" 240)" \
+                || { echo "::error::No instance of $group on $template was healthy within 4 minutes."; exit 1; }
+
+              zone="$(sed -E 's|.*/zones/([^/]+)/.*|\1|' <<<"$instance")"
+              running=""
+              for _ in 1 2 3 4 5 6; do
+                if running="$(gcloud compute instances get-guest-attributes "${instance##*/}" --zone "$zone" \
+                  --query-path=container/image --format='value(value)' 2>/dev/null)" && [ -n "$running" ]; then
+                  break
+                fi
+                sleep 5
+              done
+              if [ "${running##*@}" != "$digest" ]; then
+                echo "::error::${instance##*/} runs '$running', not $IMAGE."
+                exit 1
+              fi
+              echo "$group runs $IMAGE on ${instance##*/}"
             done
-            if [ "${running##*@}" != "$digest" ]; then
-              echo "::error::${instance##*/} runs '$running', not $IMAGE."
-              exit 1
-            fi
-            echo "$group runs $IMAGE on ${instance##*/}"
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
 
       - name: Move traffic and jobs to the new image
@@ -662,12 +699,15 @@ jobs:
               cloud-run) gcloud run services update-traffic "$resource" --to-revisions="$previous" --quiet || failed=1 ;;
               cloud-run-job) gcloud run jobs update "$resource" --image "$previous" --quiet || failed=1 ;;
               worker-pool) gcloud run worker-pools deploy "$resource" --image "$previous" --quiet || failed=1 ;;
-              instance-group)
+              instance-group | instance-group-node)
                 # shellcheck source=/dev/null
                 . "$RUNNER_TEMP/instance-group.sh"
+                gcloud compute instance-groups managed describe "$resource" \
+                  --region "$CLOUDSDK_COMPUTE_REGION" --format=json >"$RUNNER_TEMP/group.json" || failed=1
+                read -r surge unavailable < <(update_limits "$kind" "$RUNNER_TEMP/group.json")
                 if gcloud compute instance-groups managed rolling-action start-update "$resource" \
                   --region "$CLOUDSDK_COMPUTE_REGION" --version=template="$previous" \
-                  --max-surge=1 --max-unavailable=0 --quiet; then
+                  --max-surge="$surge" --max-unavailable="$unavailable" --quiet; then
                   healthy_instance "$resource" "$previous" 240 >/dev/null || failed=1
                 else
                   failed=1
