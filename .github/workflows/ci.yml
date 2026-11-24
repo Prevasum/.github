@@ -1,7 +1,8 @@
 name: CI
 
 # Lints this repo's own workflows, which the org's `pr-checks` workflows and
-# the reusable ones other repos call run from. `ci-ok` is the one check the
+# the reusable ones other repos call run from, and checks that deliver.yml
+# builds one image digest per commit. `ci-ok` is the one check the
 # `required-ci` ruleset will require.
 
 on:
@@ -37,8 +38,21 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     uses: ./.github/workflows/actionlint.yml
 
+  # Every caller pins deliver.yml at main, so a change that loses its
+  # reproducible build would reach every service's next run at once.
+  deliver-reproducible:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The runner image has docker with buildx, jq, and yq.
+      - run: .github/scripts/deliver-reproducible.sh
+
   ci-ok:
-    needs: [changes, actionlint]
+    needs: [changes, actionlint, deliver-reproducible]
     if: always()
     runs-on: ubuntu-latest
     steps:
