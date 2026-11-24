@@ -296,6 +296,15 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Without SOURCE_DATE_EPOCH, BuildKit stamps the build's own time into
+      # the image config and its history, so every run of one commit pushes a
+      # new digest. The commit's committer time is the same on every run. A
+      # Dockerfile sees the arg in RUN only if it declares it, and BuildKit
+      # leaves the times of files in the layers alone.
+      - name: Read the commit time
+        id: source-date-epoch
+        run: echo "epoch=$(git log -1 --format=%ct)" >>"$GITHUB_OUTPUT"
+
       - name: Build and push
         id: push
         uses: docker/build-push-action@v6
@@ -304,7 +313,9 @@ jobs:
           file: ${{ inputs.file }}
           target: ${{ inputs.target }}
           push: true
-          build-args: GIT_SHA=${{ github.sha }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.source-date-epoch.outputs.epoch }}
           tags: ${{ env.IMAGE_REPOSITORY }}/${{ inputs.service }}:sha-${{ github.sha }}
           # Without an attestation the push is a single image manifest, so
           # the digest recorded here is the one every deploy target reports.

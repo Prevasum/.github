@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Pre-commit gate for Prevasum/.github. Runs the same check as the `actionlint`
-# job in `.github/workflows/ci.yml`.
+# Pre-commit gate for Prevasum/.github. Runs the same checks as the
+# `actionlint` and `deliver-reproducible` jobs in `.github/workflows/ci.yml`.
 #
 # Enable once per clone:
 #
@@ -19,6 +19,21 @@ if ! git diff --cached --quiet -- .github/workflows; then
   fi
   actionlint || {
     echo "Error: actionlint failed. Commit aborted."
+    exit 1
+  }
+fi
+
+if ! git diff --cached --quiet -- .github/workflows/deliver.yml .github/scripts/deliver-reproducible.sh; then
+  echo "==> deliver-reproducible"
+  for tool in docker jq yq; do
+    if ! command -v "$tool" >/dev/null; then
+      echo "Error: $tool is not installed. The check needs docker with buildx, jq, and"
+      echo "mikefarah's yq v4 (https://github.com/mikefarah/yq#install). Commit aborted."
+      exit 1
+    fi
+  done
+  .github/scripts/deliver-reproducible.sh || {
+    echo "Error: deliver-reproducible failed. Commit aborted."
     exit 1
   }
 fi
