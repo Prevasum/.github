@@ -1,11 +1,6 @@
 # Copy this block into a repo's `.githooks/pre-commit`, after the
-# Markdown-only exit, so a commit that would fail CI's actionlint job fails
-# here first. It lints only when a workflow file is staged.
-#
-# The hook fails when actionlint isn't installed, like the other checks do
-# when their tool is missing: a skipped check would let the commit fail CI
-# instead. Keep the version in line with `ACTIONLINT_VERSION` in
-# `.github/workflows/actionlint.yml` in Prevasum/.github.
+# Markdown-only exit. Keep its version in line with `ACTIONLINT_VERSION` in
+# Prevasum/.github's `.github/workflows/actionlint.yml`.
 
 if ! git diff --cached --quiet -- .github/workflows; then
   echo "==> actionlint"

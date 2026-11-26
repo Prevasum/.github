@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Pre-commit gate for Prevasum/.github. Runs the same checks as the
-# `actionlint` and `deliver-reproducible` jobs in `.github/workflows/ci.yml`.
+# Runs CI's checks before each commit.
 #
 # Enable once per clone:
 #

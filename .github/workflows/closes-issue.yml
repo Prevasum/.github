@@ -1,7 +1,6 @@
 name: PR Closes Issue Validation
 
-# The `pr-checks` org ruleset runs this on every repo's PRs into its
-# default branch, so no repo needs its own copy.
+# The `pr-checks` org ruleset runs this on every repo's PRs.
 
 on:
   pull_request:
@@ -17,22 +16,17 @@ permissions:
 
 jobs:
   validate-closes-issue:
-    # Bot PRs close no issue: release-please's only bump the version and
-    # changelog, and openapi-sync's only update a client's copy of an API
-    # document and the code generated from it. A skipped job counts as
-    # passing, so they can still merge.
+    # Bot PRs close no issue. A skipped job counts as passing.
     if: ${{ !startsWith(github.head_ref, 'release-please--') && !startsWith(github.head_ref, 'openapi-sync--') }}
     runs-on: ubuntu-latest
     steps:
       - name: PR Closes Issue Validation
         env:
-          # The default token can't read other private repos, so a
-          # `Closes <org>/<repo>#<n>` would be listed as closing nothing.
+          # The default token can't see issues in other private repos.
           GH_TOKEN: ${{ secrets.CI_READ_TOKEN || github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
-        # GitHub lists the issues a PR closes only once the Closes line names an
-        # issue that exists. It can lag a few seconds behind an edit, so retry.
+        # Retry, since closingIssuesReferences can lag an edit by seconds.
         run: |
           for _ in 1 2 3; do
             closes="$(gh pr view "$PR" -R "$REPO" --json closingIssuesReferences \

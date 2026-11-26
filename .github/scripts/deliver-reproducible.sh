@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
-# Checks that deliver.yml's build gives one image digest per commit.
+# Checks that deliver.yml's build gives one image digest per commit, using the
+# build args read from the workflow. Two control builds without them must
+# differ, or the check can't see the build time at all.
 #
-# It builds a small image four times, each in a docker-container builder of
-# its own, as deliver.yml's runner does, and each in a later second than the
-# build before it ended. The first two pass only GIT_SHA, and their digests
-# must differ: BuildKit stamps the build's time into the image config, and a
-# check that can't see that time proves nothing. The last two pass the build
-# args deliver.yml's build step passes, with the commit time its
-# source-date-epoch step reads, and their digests must match.
-#
-# The step's command and the build args are read from deliver.yml, so this
-# tests the workflow as written. Run it from the repo root. Needs docker with
-# buildx, jq, and mikefarah's yq v4.
+# Run from the repo root. Needs docker with buildx, jq, and mikefarah's yq v4.
 
 set -euo pipefail
 
@@ -20,7 +12,6 @@ tmp=$(mktemp -d)
 builder="deliver-reproducible-$$"
 trap 'docker buildx rm --force "$builder" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
 
-# step <id> <path>: a field of the build job's step with that id.
 step() { yq -e ".jobs.build.steps[] | select(.id == \"$1\") | $2" "$workflow"; }
 
 GITHUB_OUTPUT=$tmp/output bash -euo pipefail -c "$(step source-date-epoch .run)"
@@ -32,8 +23,6 @@ fi
 
 sha=$(git rev-parse HEAD)
 deliver_args=()
-# The patterns are the workflow's expressions, quoted so the shell matches
-# them as text.
 # shellcheck disable=SC2016
 while IFS= read -r arg; do
   [ -n "$arg" ] || continue
@@ -47,8 +36,7 @@ while IFS= read -r arg; do
 done < <(step push '.with["build-args"]')
 
 mkdir "$tmp/context"
-# COPY keeps a file's mtime, so a fixed one makes the layer, and with it
-# the digest, the same in every run of this check.
+# COPY keeps a file's mtime, so a fixed one keeps the layer's digest fixed.
 echo "a file the image copies" >"$tmp/context/file"
 touch -d @0 "$tmp/context/file"
 cat >"$tmp/context/Dockerfile" <<'DOCKERFILE'
@@ -58,10 +46,8 @@ LABEL git-sha=$GIT_SHA
 COPY file /file
 DOCKERFILE
 
-# build <name> [build flags...]: builds the image as an OCI tarball and
-# writes its digest to $tmp/<name>.digest. A build in the second the one
-# before it ended could get the same time with no arg at all, so it waits
-# for the clock to pass that second.
+# Each build starts in a later second than the last one ended, since two
+# builds in one second could match without SOURCE_DATE_EPOCH.
 ended=0
 build() {
   local name=$1

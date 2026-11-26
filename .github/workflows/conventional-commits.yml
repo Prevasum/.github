@@ -1,7 +1,6 @@
 name: PR Conventional Commit Validation
 
-# The `pr-checks` org ruleset runs this on every repo's PRs into its
-# default branch, so no repo needs its own copy.
+# The `pr-checks` org ruleset runs this on every repo's PRs.
 
 on:
   pull_request:
