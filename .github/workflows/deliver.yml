@@ -19,10 +19,13 @@ name: Deliver
 #                                "secrets": {NAME: "secret:version"}}
 #   SMOKE_JOB                   the Environment's smoke Cloud Run job
 #   SMOKE_DEVICE                with smoke-device, the repo's Smoke Device in
-#                               the Environment, whose bootstrap PSK and
-#                               device key are its Secret Manager secrets
-#                               <SMOKE_DEVICE>-bootstrap-psk and
-#                               <SMOKE_DEVICE>-device-key
+#                               the Environment, whose bootstrap PSK, device
+#                               key, and PSK are its Secret Manager secrets
+#                               <SMOKE_DEVICE>-bootstrap-psk,
+#                               <SMOKE_DEVICE>-device-key, and
+#                               <SMOKE_DEVICE>-psk
+#   SMOKE_GATEWAY_URI           with smoke-device, the Environment's Gateway,
+#                               which the Smoke Device connects to
 #   CI_READER_WIF_PROVIDER      with smoke-device, the read-only CI identity's
 #   CI_READER_SERVICE_ACCOUNT   Workload Identity provider and account, which
 #                               fetch the Smoke Device's firmware
@@ -30,9 +33,12 @@ name: Deliver
 # With smoke-device, each deploy ends by running local-stack's smoke suite,
 # `smoke/run.sh` from its main branch, with the deploy's Environment in
 # SMOKE_ENVIRONMENT, the Device's ID in SMOKE_DEVICE_ID, files holding its
-# keys in SMOKE_BOOTSTRAP_PSK_FILE and SMOKE_DEVICE_KEY_FILE, the
-# Environment's smoke client secret in SMOKE_CLIENT_SECRET, and the read-only
-# CI identity, in place of the deploy identity, as its Google credentials.
+# keys in SMOKE_BOOTSTRAP_PSK_FILE, SMOKE_DEVICE_KEY_FILE, and SMOKE_PSK_FILE,
+# the Gateway in SMOKE_GATEWAY_URI, the Environment's smoke client secret in
+# SMOKE_CLIENT_SECRET, and the read-only CI identity, in place of the deploy
+# identity, as its Google credentials. The smoke build connects straight to
+# the Gateway, so it needs the PSK and SMOKE_GATEWAY_URI; both go once the
+# smoke build bootstraps, which reads its bootstrap PSK instead.
 # The suite exits non-zero when any check fails, and the deploy then rolls
 # back. A Smoke Device that isn't in service yet fails every run, so a caller
 # turns smoke-device on once its Smoke Device passes a run.
@@ -200,6 +206,7 @@ jobs:
           BUILD_ONLY: ${{ inputs.build-only }}
           SMOKE_DEVICE_ON: ${{ inputs.smoke-device }}
           SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
+          SMOKE_GATEWAY_URI: ${{ vars.SMOKE_GATEWAY_URI }}
           CI_READER_WIF_PROVIDER: ${{ vars.CI_READER_WIF_PROVIDER }}
           CI_READER_SERVICE_ACCOUNT: ${{ vars.CI_READER_SERVICE_ACCOUNT }}
           HAS_SMOKE_CLIENT_SECRET: ${{ secrets.smoke-client-secret != '' }}
@@ -214,7 +221,7 @@ jobs:
             exit 0
           fi
           if [ "$SMOKE_DEVICE_ON" = true ]; then
-            for setting in SMOKE_DEVICE CI_READER_WIF_PROVIDER CI_READER_SERVICE_ACCOUNT; do
+            for setting in SMOKE_DEVICE SMOKE_GATEWAY_URI CI_READER_WIF_PROVIDER CI_READER_SERVICE_ACCOUNT; do
               [ -n "${!setting}" ] \
                 || { echo "::error::smoke-device needs $setting in the environment"; exit 1; }
             done
@@ -666,7 +673,7 @@ jobs:
           set -euo pipefail
           umask 077
           mkdir -p "$RUNNER_TEMP/smoke-device"
-          for key in bootstrap-psk device-key; do
+          for key in bootstrap-psk device-key psk; do
             if ! gcloud secrets versions access latest --secret "$SMOKE_DEVICE-$key" \
               --out-file "$RUNNER_TEMP/smoke-device/$key"; then
               rm -rf "$RUNNER_TEMP/smoke-device"
@@ -698,10 +705,19 @@ jobs:
           path: local-stack
           persist-credentials: false
 
+      # setup-uv publishes no major-version tag, so it's pinned to a release.
+      # From the checkout, it installs the uv version local-stack asks for.
+      - name: Install uv
+        if: inputs.smoke-device
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          working-directory: local-stack
+
       - name: Run the Smoke Device
         if: inputs.smoke-device
         env:
           SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
+          SMOKE_GATEWAY_URI: ${{ vars.SMOKE_GATEWAY_URI }}
           SMOKE_CLIENT_SECRET: ${{ secrets.smoke-client-secret }}
           CI_READER_CREDENTIALS: ${{ steps.ci-reader.outputs.credentials_file_path }}
         run: |
@@ -718,6 +734,7 @@ jobs:
             SMOKE_DEVICE_ID="$SMOKE_DEVICE" \
             SMOKE_BOOTSTRAP_PSK_FILE="$RUNNER_TEMP/smoke-device/bootstrap-psk" \
             SMOKE_DEVICE_KEY_FILE="$RUNNER_TEMP/smoke-device/device-key" \
+            SMOKE_PSK_FILE="$RUNNER_TEMP/smoke-device/psk" \
             timeout 600 bash local-stack/smoke/run.sh || status=$?
           rm -rf "$RUNNER_TEMP/smoke-device"
           case "$status" in
