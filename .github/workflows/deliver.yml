@@ -1,102 +1,70 @@
 name: Deliver
 
-# A service repo calls this on every push to its main branch. This repo is
-# public, so every identifier comes from the caller's GitHub environment for
-# dev (the `environment` input), which sets these variables:
+# Builds a service's image once and deploys it to dev. A service repo calls
+# this on each push to main, granting `contents: read` and `id-token: write`.
+#
+# This repo is public, so identifiers come from the caller's GitHub
+# environment (the `environment` input):
 #
 #   GCP_PROJECT                 the Environment's project
-#   GCP_REGION                  where its Cloud Run services, jobs, worker
-#                               pools, and instance groups run
-#   GCP_WIF_PROVIDER            its Workload Identity provider
-#   GCP_DEPLOY_SERVICE_ACCOUNT  the repo's deploy identity there
-#   IMAGE_REPOSITORY            the service's repository in the image registry
-#   DEPLOY_RESOURCES            a JSON object naming, for each target and the
-#                               migrations job, its resource in the Environment
-#   DEPLOY_ENV                  optional: a JSON object giving, for a
-#                               cloud-run target, the environment its
-#                               revisions run with, as
-#                               {"vars": {NAME: value},
-#                                "secrets": {NAME: "secret:version"}}
-#   SMOKE_JOB                   the Environment's smoke Cloud Run job
-#   SMOKE_DEVICE                with smoke-device, the repo's Smoke Device in
-#                               the Environment, whose bootstrap PSK, device
-#                               key, and PSK are its Secret Manager secrets
-#                               <SMOKE_DEVICE>-bootstrap-psk,
-#                               <SMOKE_DEVICE>-device-key, and
-#                               <SMOKE_DEVICE>-psk
-#   SMOKE_GATEWAY_URI           with smoke-device, the Environment's Gateway,
-#                               which the Smoke Device connects to
-#   CI_READER_WIF_PROVIDER      with smoke-device, the read-only CI identity's
-#   CI_READER_SERVICE_ACCOUNT   Workload Identity provider and account, which
-#                               fetch the Smoke Device's firmware
+#   GCP_REGION                  the region its resources run in
+#   GCP_WIF_PROVIDER            Workload Identity provider
+#   GCP_DEPLOY_SERVICE_ACCOUNT  the repo's deploy identity
+#   IMAGE_REPOSITORY            the service's image registry repository
+#   DEPLOY_RESOURCES            JSON object mapping each target, and the
+#                               migrations job, to its resource name
+#   DEPLOY_ENV                  optional, see below
+#   SMOKE_JOB                   the smoke Cloud Run job
 #
-# With smoke-device, each deploy ends by running local-stack's smoke suite,
-# `smoke/run.sh` from its main branch, with the deploy's Environment in
-# SMOKE_ENVIRONMENT, the Device's ID in SMOKE_DEVICE_ID, files holding its
-# keys in SMOKE_BOOTSTRAP_PSK_FILE, SMOKE_DEVICE_KEY_FILE, and SMOKE_PSK_FILE,
-# the Gateway in SMOKE_GATEWAY_URI, the Environment's smoke client secret in
-# SMOKE_CLIENT_SECRET, and the read-only CI identity, in place of the deploy
-# identity, as its Google credentials. The smoke build connects straight to
-# the Gateway, so it needs the PSK and SMOKE_GATEWAY_URI; both go once the
-# smoke build bootstraps, which reads its bootstrap PSK instead.
-# The suite exits non-zero when any check fails, and the deploy then rolls
-# back. A Smoke Device that isn't in service yet fails every run, so a caller
-# turns smoke-device on once its Smoke Device passes a run.
+# and with smoke-device:
 #
-# A cloud-run target with a DEPLOY_ENV entry deploys its candidate with
-# exactly the entry's variables and secrets, replacing the ones the serving
-# revision has, so a change to them goes through the smoke test like a new
-# image does. The entry owns every literal variable and every secret, mounted
-# ones included, so an empty "vars" or "secrets" clears them. A target with
-# no entry copies the serving revision's.
+#   SMOKE_DEVICE                the repo's Smoke Device, whose Secret Manager
+#                               secrets are <SMOKE_DEVICE>-bootstrap-psk,
+#                               <SMOKE_DEVICE>-device-key, <SMOKE_DEVICE>-psk
+#   SMOKE_GATEWAY_URI           the Gateway it connects to
+#   CI_READER_WIF_PROVIDER      the read-only CI identity, which fetches the
+#   CI_READER_SERVICE_ACCOUNT   Smoke Device's firmware
 #
-# An instance-group target is a regional managed instance group that
-# autoheals on the health check its load balancer uses, or, for a service
-# run as several nodes, a DEPLOY_RESOURCES list of one group per node, which
-# deploy one after another, each replacing its instance in place. Its instance
-# template's metadata `image` names the image its instances run, and each
-# instance, once its container starts, writes that container's image by
-# digest to its guest attribute `container/image`.
+# DEPLOY_ENV maps a cloud-run target to
+# {"vars": {NAME: value}, "secrets": {NAME: "secret:version"}}. The entry
+# replaces all the literal variables and secrets, mounted ones included. A
+# target with no entry keeps the serving revision's.
 #
-# With build-only, the run builds the image once, pushes `sha-<sha>`, and
-# moves `:prod` to that digest, and does nothing else: no deploy, migrations,
-# smoke test, or rollback, and `:dev` stays where it is, since nothing was
-# deployed to dev. It needs only GCP_WIF_PROVIDER, GCP_DEPLOY_SERVICE_ACCOUNT,
-# IMAGE_REPOSITORY, and GCP_PROJECT; `targets` may be `[]`, `tag-prod` is
-# ignored, and `migrations` and `smoke-device` have no effect. A `:prod` set
-# this way was NOT smoke-tested. The repo's pre-merge end-to-end check, which
-# its CI requires, stands in for the gate until the repo deploys through an
-# instance-group target.
+# An instance-group target is a regional managed instance group that autoheals
+# on its load balancer's health check. Its instance template's `image` metadata
+# names the image, and each instance writes the digest it runs to its guest
+# attribute `container/image`. For a service with several nodes,
+# DEPLOY_RESOURCES lists one group per node, and they deploy one at a time,
+# each replacing its instance in place.
 #
-# A repo whose Docker context needs a private submodule, such as `proto`,
-# sets `submodules` to `true` or `recursive` and passes `checkout-token`, a
-# token that can read it. The checkout then uses that token, and clones an
-# SSH-form submodule URL over HTTPS with it. Without them the checkout is the
-# repo alone, with the workflow's own token.
+# smoke-device runs `smoke/run.sh` from local-stack's main branch, which
+# documents its inputs. SMOKE_PSK_FILE and SMOKE_GATEWAY_URI are interim, until
+# the smoke build bootstraps. Turn smoke-device on only after the Smoke Device
+# passes a run, or every deploy rolls back.
 #
-# The caller grants `contents: read` and `id-token: write`, since a called
-# workflow can't hold more than its caller.
+# build-only needs only GCP_PROJECT, GCP_WIF_PROVIDER,
+# GCP_DEPLOY_SERVICE_ACCOUNT, and IMAGE_REPOSITORY. The :prod it sets is NOT
+# smoke-tested.
 
 on:
   workflow_call:
     inputs:
       service:
-        description: The image's name, and its repository's in the registry.
+        description: The image's name.
         required: true
         type: string
       targets:
         description: >-
-          A JSON list of deploy targets, each {"name": ..., "kind": ...}, all
-          deployed from the one image. Kinds: cloud-run, cloud-run-job,
-          worker-pool, instance-group. A target with "prod-only": true runs
-          outside every Environment, so this only builds its image. With
-          build-only, [] is allowed and the list is otherwise ignored.
+          A JSON list of {"name": ..., "kind": ...}, all deployed from the one
+          image. Kinds: cloud-run, cloud-run-job, worker-pool, instance-group.
+          A "prod-only": true target is built but not deployed. May be [] with
+          build-only.
         required: true
         type: string
       migrations:
         description: >-
-          A target name for a Cloud Run job that runs once to completion, on
-          the new image, before any target deploys.
+          The target name of a Cloud Run job that runs on the new image before
+          any target deploys.
         required: false
         type: string
         default: ""
@@ -111,9 +79,7 @@ on:
         type: string
         default: ""
       target:
-        description: >-
-          The Dockerfile stage to build, when the service isn't its last stage,
-          such as a second service built from the same Dockerfile.
+        description: The Dockerfile stage to build, when it isn't the last.
         required: false
         type: string
         default: ""
@@ -123,47 +89,41 @@ on:
         type: string
         default: development
       image-repository:
-        description: >-
-          The service's repository in the image registry, when it isn't the
-          environment's IMAGE_REPOSITORY.
+        description: Overrides the environment's IMAGE_REPOSITORY.
         required: false
         type: string
         default: ""
       tag-prod:
         description: >-
-          Also move :prod once dev passes, so readers have a prod image to
-          resolve before the service has a prod Environment to promote to.
+          Also move :prod once dev passes, for a service with no prod
+          Environment to promote to yet.
         required: false
         type: boolean
         default: true
       smoke-device:
         description: >-
-          End each deploy by running the repo's Smoke Device, which the
-          environment's SMOKE_DEVICE names, through the smoke suite.
+          Run the environment's SMOKE_DEVICE through the smoke suite on each
+          deploy.
         required: false
         type: boolean
         default: false
       build-only:
         description: >-
-          Build the image and move :prod to it, with no deploy, migrations,
-          smoke test, or rollback, and never :dev. Ignores tag-prod. For a
-          repo not yet deploying through this workflow, so readers have a
-          :prod image to resolve.
+          Only build the image and move :prod to it: no deploy, migrations,
+          smoke test, rollback, or :dev. Ignores tag-prod and smoke-device.
         required: false
         type: boolean
         default: false
       submodules:
         description: >-
-          Check out submodules for the build: '' for none, 'true', or
-          'recursive'. A private one needs the checkout-token secret.
+          Submodules to check out: '' (none), 'true', or 'recursive'. Private
+          ones need checkout-token.
         required: false
         type: string
         default: ""
     secrets:
       checkout-token:
-        description: >-
-          A token that can read the repo's private submodules, used for the
-          build's checkout in place of the workflow's own token.
+        description: A token that can read the repo's private submodules.
         required: false
       smoke-client-secret:
         description: With smoke-device, the dev smoke client's secret.
@@ -173,8 +133,7 @@ on:
         required: false
       oncall-webhook:
         description: >-
-          The incoming webhook of the Server on-call Chat space, which a run
-          that fails or rolls back posts to.
+          The Server on-call Chat webhook, posted to when a run fails.
         required: false
     outputs:
       image:
@@ -195,7 +154,6 @@ jobs:
       image: ${{ steps.image.outputs.image }}
       dev-targets: ${{ steps.targets.outputs.dev-targets }}
     steps:
-      # Checked before building, so a misconfigured caller fails in seconds.
       - name: Check the targets
         id: targets
         env:
@@ -213,7 +171,6 @@ jobs:
           HAS_LOCAL_STACK_TOKEN: ${{ secrets.local-stack-token != '' }}
         run: |
           set -euo pipefail
-          # Nothing deploys, so there are no targets or resources to check.
           if [ "$BUILD_ONLY" = true ]; then
             jq -e 'type == "array"' <<<"$TARGETS" >/dev/null \
               || { echo "::error::targets must be a JSON list"; exit 1; }
@@ -242,8 +199,6 @@ jobs:
           jq -e 'all(.[]; .["prod-only"] | . == null or type == "boolean")' <<<"$TARGETS" >/dev/null \
             || { echo "::error::a target's prod-only must be true or false"; failed=1; }
           dev_targets="$(jq -c 'map(select(.["prod-only"] != true))' <<<"$TARGETS")"
-          # Only what deploys to dev needs a resource there, so a repo whose
-          # targets are all prod-only sets no DEPLOY_RESOURCES.
           if [ "$dev_targets" = "[]" ] && [ -z "$MIGRATIONS" ]; then
             echo "dev-targets=[]" >>"$GITHUB_OUTPUT"
             exit "$failed"
@@ -253,7 +208,6 @@ jobs:
           for name in $(jq -r '.[].name' <<<"$dev_targets") $MIGRATIONS; do
             jq -e --arg n "$name" '.[$n] | type == "string"' <<<"$DEPLOY_RESOURCES" >/dev/null \
               && continue
-            # Only an instance-group target may name several, one per node.
             if jq -e --arg n "$name" 'map(select(.name == $n and .kind == "instance-group")) | length > 0' \
                 <<<"$dev_targets" >/dev/null \
               && jq -e --arg n "$name" '.[$n] | type == "array" and length > 0 and all(.[]; type == "string")' \
@@ -263,9 +217,9 @@ jobs:
             echo "::error::DEPLOY_RESOURCES names no resource for $name"
             failed=1
           done
-          # Both keys are required, since a missing one would clear what the
-          # revision has. A secret is joined into gcloud's NAME=SECRET:VERSION
-          # list, so neither part may hold a comma or an equals sign.
+          # Both keys are required, since a missing one would clear the
+          # revision's. gcloud takes secrets as a NAME=SECRET:VERSION,... list,
+          # hence no commas or equals signs.
           if [ -n "$DEPLOY_ENV" ]; then
             if jq -e 'type == "object" and all(.[];
                   type == "object" and has("vars") and has("secrets")
@@ -303,11 +257,9 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Without SOURCE_DATE_EPOCH, BuildKit stamps the build's own time into
-      # the image config and its history, so every run of one commit pushes a
-      # new digest. The commit's committer time is the same on every run. A
-      # Dockerfile sees the arg in RUN only if it declares it, and BuildKit
-      # leaves the times of files in the layers alone.
+      # Without SOURCE_DATE_EPOCH, BuildKit stamps the build time into the
+      # image, so each run of a commit pushes a new digest. A Dockerfile's RUN
+      # sees it only if declared, and layer file times stay as they are.
       - name: Read the commit time
         id: source-date-epoch
         run: echo "epoch=$(git log -1 --format=%ct)" >>"$GITHUB_OUTPUT"
@@ -324,8 +276,8 @@ jobs:
             GIT_SHA=${{ github.sha }}
             SOURCE_DATE_EPOCH=${{ steps.source-date-epoch.outputs.epoch }}
           tags: ${{ env.IMAGE_REPOSITORY }}/${{ inputs.service }}:sha-${{ github.sha }}
-          # Without an attestation the push is a single image manifest, so
-          # the digest recorded here is the one every deploy target reports.
+          # An attestation would make the digest differ from the one deploy
+          # targets report.
           provenance: false
           cache-from: type=gha,scope=deliver-${{ inputs.service }}
           cache-to: type=gha,scope=deliver-${{ inputs.service }},mode=max
@@ -344,11 +296,9 @@ jobs:
     if: inputs.build-only == false && needs.build.outputs.dev-targets != '[]'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    # A Smoke Device can play only one run at a time, and one repo can
-    # deploy several services, so with one every deploy from the repo to the
-    # Environment takes its turn in the Smoke Device's group. The deploy and
-    # the Smoke Device's run stay one job, so a newer deploy never lands
-    # between this deploy and its check, or under its rollback.
+    # A Smoke Device plays one run at a time, so a repo's smoke deploys share
+    # one group. Deploy and smoke run stay one job so that no newer deploy
+    # lands between them.
     concurrency:
       group: ${{ inputs.smoke-device && 'smoke-device-dev' || format('deliver-{0}', inputs.service) }}
       cancel-in-progress: false
@@ -370,8 +320,8 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      # Migrations only expand the schema, so the revisions still serving keep
-      # working on it, and a rollback leaves it in place.
+      # Migrations only expand the schema, so serving revisions keep working
+      # and a rollback leaves it in place.
       - name: Run the migrations
         if: inputs.migrations != ''
         env:
@@ -385,23 +335,19 @@ jobs:
       - name: Deploy candidates
         run: |
           set -euo pipefail
-          # The rollback step restores what rollback.tsv records, written as
-          # each target changes.
           : >"$RUNNER_TEMP/rollback.tsv"
           : >"$RUNNER_TEMP/candidates.tsv"
           while IFS=$'\t' read -r name kind; do
             resource="$(jq -r --arg n "$name" '.[$n]' <<<"$DEPLOY_RESOURCES")"
             case "$kind" in
               cloud-run)
-                # Without an entry, gcloud copies the serving revision's
-                # environment, as it always has.
                 env_flags=()
                 entry="$(jq -c --arg n "$name" '.[$n] // empty' <<<"${DEPLOY_ENV:-null}")"
                 if [ -n "$entry" ]; then
                   if jq -e '.vars == {}' <<<"$entry" >/dev/null; then
                     env_flags+=(--clear-env-vars)
                   else
-                    # A file, because a value may hold the commas that
+                    # A file, since a value may hold the commas that
                     # --set-env-vars splits on.
                     jq '.vars' <<<"$entry" >"$RUNNER_TEMP/env-vars.yaml"
                     env_flags+=(--env-vars-file "$RUNNER_TEMP/env-vars.yaml")
@@ -424,10 +370,10 @@ jobs:
             esac
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
 
-      # The smoke job reaches internal-ingress services and IAP-fronted ones
-      # alike, which a GitHub runner can't. Its container sets no command, so
-      # these arguments are its whole command line, and gcloud's ^@^ prefix
-      # splits them on @, which the script must not contain.
+      # A Cloud Run job reaches internal and IAP-fronted services, which a
+      # runner can't. Its container sets no command, so --args is the whole
+      # command line, split on @ (gcloud's ^@^), which the script must not
+      # contain.
       - name: Smoke-test the candidates
         env:
           SMOKE_JOB: ${{ vars.SMOKE_JOB }}
@@ -462,12 +408,10 @@ jobs:
           done <"$RUNNER_TEMP/candidates.tsv"
           gcloud run jobs execute "$SMOKE_JOB" --args="$args" --wait
 
-      # A worker pool takes no requests, so it has no candidate to test before
-      # it takes over: its new revision takes every instance at once, and a
-      # failure deploys the digest it ran before. The previous digest is
-      # recorded before the deploy, so a deploy that fails partway rolls back
-      # too, and the deploy's bound leaves the rollback time to finish inside
-      # the 5 minutes a failed deploy may last.
+      # Worker pools take no requests, so there's no candidate to test: the new
+      # revision takes every instance at once. The previous digest is recorded
+      # first, so a partial deploy rolls back too. The timeout leaves time for
+      # that.
       - name: Update the worker pools
         run: |
           set -euo pipefail
@@ -504,21 +448,16 @@ jobs:
             echo "$resource runs $IMAGE on revision $revision"
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
 
-      # A new template copies the current one but for its image, and a
-      # rolling update brings an instance up on it before the old one goes.
-      # The old one can drain for up to an hour, so this waits only for the
-      # new one to be healthy, which, since the group autoheals on its load
-      # balancer's health check, is when the load balancer sends it new
-      # flows. `wait-until --stable` would wait out the drain too. The bounds
-      # leave the rollback time to finish inside the 5 minutes a failed
-      # deploy may last.
+      # Waits only until the new instance is healthy, which is when the load
+      # balancer sends it new flows. `wait-until --stable` would also wait for
+      # the old one to drain. The wait is bounded to leave time to roll back.
       - name: Roll out the instance groups
         run: |
           set -euo pipefail
           # The rollback step runs this file too.
           cat >"$RUNNER_TEMP/instance-group.sh" <<'HELPERS'
-          # Waits up to $3 seconds for an instance of group $1 on template $2
-          # to be running and healthy, and prints its URL.
+          # healthy_instance GROUP TEMPLATE SECONDS: waits for a healthy
+          # instance on TEMPLATE and prints its URL.
           healthy_instance() {
             local deadline=$((SECONDS + $3)) instance
             while :; do
@@ -541,12 +480,10 @@ jobs:
             done
           }
 
-          # Prints the max surge and max unavailable for a rolling update of
-          # the group described in $2: an instance-group surges a new instance
-          # first, and an instance-group-node replaces its one instance in
-          # place, since its node ID may be held by one instance at a time. A
-          # regional group refuses a fixed number other than 0 below its zone
-          # count, so the nonzero one is that count.
+          # update_limits KIND GROUP_JSON: prints a rolling update's max surge
+          # and max unavailable. A node is replaced in place, since only one
+          # instance may hold its node ID. A regional group refuses a nonzero
+          # value below its zone count.
           update_limits() {
             local zones
             zones="$(jq '[.distributionPolicy.zones[]?] | length | if . == 0 then 1 else . end' "$2")"
@@ -564,10 +501,6 @@ jobs:
           digest="${IMAGE##*@}"
           while IFS=$'\t' read -r name kind; do
             [ "$kind" = instance-group ] || continue
-            # A service with several nodes lists their groups, and each node
-            # ID may be held by one instance at a time, so each group replaces
-            # its instance in place, surge 0, and the next starts only once
-            # this one's new instance is healthy. One group keeps surge.
             mapfile -t groups < <(jq -r --arg n "$name" \
               '.[$n] | if type == "array" then .[] else . end' <<<"$DEPLOY_RESOURCES")
             if [ "${#groups[@]}" -gt 1 ]; then record="instance-group-node"; else record="instance-group"; fi
@@ -599,8 +532,8 @@ jobs:
                     | del(.metadata.fingerprint))}' \
                   "$RUNNER_TEMP/current.json" >"$RUNNER_TEMP/template.json"
                 operation="$(curl -fsS "${auth[@]}" --data @"$RUNNER_TEMP/template.json" "${current%/*}" | jq -r .selfLink)"
-                # Each wait call returns when the operation is done or after
-                # about 2 minutes, whichever is first.
+                # A wait call can return, after about 2 minutes, before the
+                # operation is done.
                 while :; do
                   curl -fsS "${auth[@]}" -X POST "$operation/wait" >"$RUNNER_TEMP/operation.json"
                   jq -e '.status == "DONE"' "$RUNNER_TEMP/operation.json" >/dev/null && break
@@ -663,8 +596,8 @@ jobs:
             esac
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
 
-      # The Smoke Device checks in through the Server as it now serves, so it
-      # runs once every target has the new image.
+      # After the rollout, so the Smoke Device checks the Server as it now
+      # serves.
       - name: Read the Smoke Device's keys
         if: inputs.smoke-device
         env:
@@ -722,8 +655,7 @@ jobs:
           CI_READER_CREDENTIALS: ${{ steps.ci-reader.outputs.credentials_file_path }}
         run: |
           set -euo pipefail
-          # The bound keeps a hung run from holding the Smoke Device's group;
-          # the suite's own waits are far shorter.
+          # Bounded so a hung run can't hold the concurrency group.
           status=0
           env -u GOOGLE_GHA_CREDS_PATH -u CLOUDSDK_CORE_PROJECT -u CLOUDSDK_PROJECT \
             -u GCLOUD_PROJECT -u GCP_PROJECT -u GOOGLE_CLOUD_PROJECT \
@@ -743,8 +675,7 @@ jobs:
             *) echo "::error::$SMOKE_DEVICE failed the smoke suite."; exit 1 ;;
           esac
 
-      # Only digests that passed smoke get an Environment tag, since every
-      # reader of a tag trusts it.
+      # After smoke, since every reader of a tag trusts its digest.
       - name: Move the Environment tags
         env:
           TAG_PROD: ${{ inputs.tag-prod }}
@@ -764,8 +695,8 @@ jobs:
             gcloud artifacts docker tags add "$IMAGE" "$repository:$tag" --quiet
           done
 
-      # A candidate that failed smoke never took traffic, so this undoes only
-      # what the steps after smoke changed.
+      # A candidate that failed smoke never took traffic, so it needs no
+      # rollback.
       - name: Roll back
         id: rollback
         if: failure()
@@ -806,8 +737,6 @@ jobs:
           fi
           exit "$failed"
 
-  # Only :prod moves, and to a digest nothing deployed, so there is nothing to
-  # roll back: a failed move leaves :prod where it was.
   publish-prod:
     needs: build
     if: inputs.build-only
@@ -831,7 +760,6 @@ jobs:
         run: |
           set -euo pipefail
           repository="${IMAGE%@*}"
-          # A tag's first move has no previous digest.
           if previous="$(gcloud artifacts docker images describe "$repository:prod" \
             --format='value(image_summary.digest)' 2>/dev/null)"; then
             echo "Moved $repository:prod from $previous to ${IMAGE##*@}" >>"$GITHUB_STEP_SUMMARY"
@@ -840,8 +768,7 @@ jobs:
           fi
           gcloud artifacts docker tags add "$IMAGE" "$repository:prod" --quiet
 
-  # A run can't fail or roll back without a needed job failing. A cancelled
-  # run, replaced by a newer pending one, is neither.
+  # failure() skips a run cancelled for a newer pending one.
   notify:
     needs: [build, dev, publish-prod]
     if: failure()
