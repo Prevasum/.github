@@ -19,9 +19,8 @@ name: Deliver
 # and with smoke-device:
 #
 #   SMOKE_DEVICE                the repo's Smoke Device, whose Secret Manager
-#                               secrets are <SMOKE_DEVICE>-bootstrap-psk,
-#                               <SMOKE_DEVICE>-device-key, <SMOKE_DEVICE>-psk
-#   SMOKE_GATEWAY_URI           the Gateway it connects to
+#                               secrets are <SMOKE_DEVICE>-bootstrap-psk and
+#                               <SMOKE_DEVICE>-device-key
 #   CI_READER_WIF_PROVIDER      the read-only CI identity, which fetches the
 #   CI_READER_SERVICE_ACCOUNT   Smoke Device's firmware
 #
@@ -41,9 +40,9 @@ name: Deliver
 # the same way.
 #
 # smoke-device runs `smoke/run.sh` from local-stack's main branch, which
-# documents its inputs. SMOKE_PSK_FILE and SMOKE_GATEWAY_URI are interim, until
-# the smoke build bootstraps. Turn smoke-device on only after the Smoke Device
-# passes a run, or every deploy rolls back.
+# documents its inputs. The Smoke Device bootstraps, so it's given no Gateway
+# URI or PSK. Turn smoke-device on only after the Smoke Device passes a run, or
+# every deploy rolls back.
 #
 # build-only needs only GCP_PROJECT, GCP_WIF_PROVIDER,
 # GCP_DEPLOY_SERVICE_ACCOUNT, and IMAGE_REPOSITORY. The :prod it sets is NOT
@@ -168,7 +167,6 @@ jobs:
           BUILD_ONLY: ${{ inputs.build-only }}
           SMOKE_DEVICE_ON: ${{ inputs.smoke-device }}
           SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
-          SMOKE_GATEWAY_URI: ${{ vars.SMOKE_GATEWAY_URI }}
           CI_READER_WIF_PROVIDER: ${{ vars.CI_READER_WIF_PROVIDER }}
           CI_READER_SERVICE_ACCOUNT: ${{ vars.CI_READER_SERVICE_ACCOUNT }}
           HAS_SMOKE_CLIENT_SECRET: ${{ secrets.smoke-client-secret != '' }}
@@ -182,7 +180,7 @@ jobs:
             exit 0
           fi
           if [ "$SMOKE_DEVICE_ON" = true ]; then
-            for setting in SMOKE_DEVICE SMOKE_GATEWAY_URI CI_READER_WIF_PROVIDER CI_READER_SERVICE_ACCOUNT; do
+            for setting in SMOKE_DEVICE CI_READER_WIF_PROVIDER CI_READER_SERVICE_ACCOUNT; do
               [ -n "${!setting}" ] \
                 || { echo "::error::smoke-device needs $setting in the environment"; exit 1; }
             done
@@ -614,7 +612,7 @@ jobs:
           set -euo pipefail
           umask 077
           mkdir -p "$RUNNER_TEMP/smoke-device"
-          for key in bootstrap-psk device-key psk; do
+          for key in bootstrap-psk device-key; do
             if ! gcloud secrets versions access latest --secret "$SMOKE_DEVICE-$key" \
               --out-file "$RUNNER_TEMP/smoke-device/$key"; then
               rm -rf "$RUNNER_TEMP/smoke-device"
@@ -658,7 +656,6 @@ jobs:
         if: inputs.smoke-device
         env:
           SMOKE_DEVICE: ${{ vars.SMOKE_DEVICE }}
-          SMOKE_GATEWAY_URI: ${{ vars.SMOKE_GATEWAY_URI }}
           SMOKE_CLIENT_SECRET: ${{ secrets.smoke-client-secret }}
           CI_READER_CREDENTIALS: ${{ steps.ci-reader.outputs.credentials_file_path }}
         run: |
@@ -674,7 +671,6 @@ jobs:
             SMOKE_DEVICE_ID="$SMOKE_DEVICE" \
             SMOKE_BOOTSTRAP_PSK_FILE="$RUNNER_TEMP/smoke-device/bootstrap-psk" \
             SMOKE_DEVICE_KEY_FILE="$RUNNER_TEMP/smoke-device/device-key" \
-            SMOKE_PSK_FILE="$RUNNER_TEMP/smoke-device/psk" \
             timeout 600 bash local-stack/smoke/run.sh || status=$?
           rm -rf "$RUNNER_TEMP/smoke-device"
           case "$status" in
