@@ -33,9 +33,12 @@ name: Deliver
 # An instance-group target is a regional managed instance group that autoheals
 # on its load balancer's health check. Its instance template's `image` metadata
 # names the image, and each instance writes the digest it runs to its guest
-# attribute `container/image`. For a service with several nodes,
-# DEPLOY_RESOURCES lists one group per node, and they deploy one at a time,
-# each replacing its instance in place.
+# attribute `container/image`. An instance-group-node target is the same, for
+# a service whose instances each hold a node ID that only one may have at a
+# time: its groups, one per node, deploy one at a time, each replacing its
+# instance in place at surge 0, even when there is only one. An
+# instance-group target that lists several groups in DEPLOY_RESOURCES deploys
+# the same way.
 #
 # smoke-device runs `smoke/run.sh` from local-stack's main branch, which
 # documents its inputs. SMOKE_PSK_FILE and SMOKE_GATEWAY_URI are interim, until
@@ -56,7 +59,8 @@ on:
       targets:
         description: >-
           A JSON list of {"name": ..., "kind": ...}, all deployed from the one
-          image. Kinds: cloud-run, cloud-run-job, worker-pool, instance-group.
+          image. Kinds: cloud-run, cloud-run-job, worker-pool, instance-group,
+          instance-group-node.
           A "prod-only": true target is built but not deployed. May be [] with
           build-only.
         required: true
@@ -192,7 +196,7 @@ jobs:
           failed=0
           while IFS=$'\t' read -r name kind; do
             case "$kind" in
-              cloud-run | cloud-run-job | worker-pool | instance-group) ;;
+              cloud-run | cloud-run-job | worker-pool | instance-group | instance-group-node) ;;
               *) echo "::error::target $name has unknown kind '$kind'"; failed=1 ;;
             esac
           done < <(jq -r '.[] | [.name, .kind] | @tsv' <<<"$TARGETS")
@@ -208,7 +212,7 @@ jobs:
           for name in $(jq -r '.[].name' <<<"$dev_targets") $MIGRATIONS; do
             jq -e --arg n "$name" '.[$n] | type == "string"' <<<"$DEPLOY_RESOURCES" >/dev/null \
               && continue
-            if jq -e --arg n "$name" 'map(select(.name == $n and .kind == "instance-group")) | length > 0' \
+            if jq -e --arg n "$name" 'map(select(.name == $n and (.kind == "instance-group" or .kind == "instance-group-node"))) | length > 0' \
                 <<<"$dev_targets" >/dev/null \
               && jq -e --arg n "$name" '.[$n] | type == "array" and length > 0 and all(.[]; type == "string")' \
                 <<<"$DEPLOY_RESOURCES" >/dev/null; then
@@ -464,7 +468,7 @@ jobs:
               instance="$(gcloud compute instance-groups managed list-instances "$1" \
                 --region "$CLOUDSDK_COMPUTE_REGION" --format=json \
                 | jq -r --arg t "${2#*/projects/}" 'first(.[]
-                    | select((.version.instanceTemplate | sub("^.*/projects/"; "")) == $t
+                    | select(((.version.instanceTemplate // "") | sub("^.*/projects/"; "")) == $t
                       and .instanceStatus == "RUNNING" and .currentAction == "NONE"
                       and (.instanceHealth // []) != []
                       and all(.instanceHealth[]; .detailedHealthState == "HEALTHY"))
@@ -500,10 +504,14 @@ jobs:
           auth=(-H "Authorization: Bearer $token" -H "Content-Type: application/json")
           digest="${IMAGE##*@}"
           while IFS=$'\t' read -r name kind; do
-            [ "$kind" = instance-group ] || continue
+            [ "$kind" = instance-group ] || [ "$kind" = instance-group-node ] || continue
             mapfile -t groups < <(jq -r --arg n "$name" \
               '.[$n] | if type == "array" then .[] else . end' <<<"$DEPLOY_RESOURCES")
-            if [ "${#groups[@]}" -gt 1 ]; then record="instance-group-node"; else record="instance-group"; fi
+            if [ "$kind" = instance-group-node ] || [ "${#groups[@]}" -gt 1 ]; then
+              record="instance-group-node"
+            else
+              record="instance-group"
+            fi
             for group in "${groups[@]}"; do
               gcloud compute instance-groups managed describe "$group" \
                 --region "$CLOUDSDK_COMPUTE_REGION" --format=json >"$RUNNER_TEMP/group.json"
