@@ -484,6 +484,19 @@ jobs:
             done
           }
 
+          # health_wait KIND: how many seconds an instance gets to come up
+          # healthy. A node replaced in place drains, is deleted, and only
+          # then has its replacement created and booted, which took about
+          # 4.5 minutes on the Gateway; a surged instance boots beside the
+          # old one.
+          health_wait() {
+            if [ "$1" = instance-group-node ]; then
+              echo 600
+            else
+              echo 240
+            fi
+          }
+
           # update_limits KIND GROUP_JSON: prints a rolling update's max surge
           # and max unavailable. A node is replaced in place, since only one
           # instance may hold its node ID. A regional group refuses a nonzero
@@ -563,8 +576,9 @@ jobs:
                 --region "$CLOUDSDK_COMPUTE_REGION" --version=template="$template" \
                 --max-surge="$surge" --max-unavailable="$unavailable" --quiet
               printf '%s\t%s\t%s\n' "$record" "$group" "$current" >>"$RUNNER_TEMP/rollback.tsv"
-              instance="$(healthy_instance "$group" "$template" 240)" \
-                || { echo "::error::No instance of $group on $template was healthy within 4 minutes."; exit 1; }
+              seconds="$(health_wait "$record")"
+              instance="$(healthy_instance "$group" "$template" "$seconds")" \
+                || { echo "::error::No instance of $group on $template was healthy within $((seconds / 60)) minutes."; exit 1; }
 
               zone="$(sed -E 's|.*/zones/([^/]+)/.*|\1|' <<<"$instance")"
               running=""
@@ -729,7 +743,7 @@ jobs:
                 if gcloud compute instance-groups managed rolling-action start-update "$resource" \
                   --region "$CLOUDSDK_COMPUTE_REGION" --version=template="$previous" \
                   --max-surge="$surge" --max-unavailable="$unavailable" --quiet; then
-                  healthy_instance "$resource" "$previous" 240 >/dev/null || failed=1
+                  healthy_instance "$resource" "$previous" "$(health_wait "$kind")" >/dev/null || failed=1
                 else
                   failed=1
                 fi
